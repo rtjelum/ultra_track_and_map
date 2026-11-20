@@ -11,6 +11,17 @@ The code is currently a **simulator with a live visualizer**: it simulates the
 room acoustics and runs the full signal-processing pipeline on the simulated
 microphone signals.
 
+![Simulation: tracking a moving object and mapping the room](docs/simulation.gif)
+
+*Left: top view of the 3 × 2 m room with the mic bar and speaker (TX) on the
+left wall. Yellow = true object position, cyan ◆ = Kalman estimate, orange × =
+raw single-ping fix, green arrow = estimated velocity, dashed pink = room
+outline estimated by wall mapping. Right: per-mic echo envelopes and the
+tracked trajectory with speed readout. 10 s, real time, after the 2 s
+background calibration.*
+
+To regenerate the GIF: `python tools/make_gif.py` (writes `docs/simulation.gif`).
+
 ## Quick start
 
 ```sh

@@ -653,8 +653,8 @@ wall_line, = ax_room.plot([], [], "--", color="#ff66cc", lw=2.0, zorder=4)
 wall_txt = ax_room.text(0.98, 0.03, "", transform=ax_room.transAxes,
                         color="#ff66cc", fontsize=8.5, va="bottom", ha="right",
                         fontfamily="monospace",
-                        bbox=dict(boxstyle="round,pad=0.4", facecolor="#00000099",
-                                  edgecolor="#444444"))
+                        bbox=dict(boxstyle="round,pad=0.4", facecolor="#000000cc",
+                                  edgecolor="#444444"), zorder=10)
 
 # text overlay
 info_txt = ax_room.text(
