@@ -15,7 +15,8 @@ extracted one at a time, strongest first (CLEAN, as in radar/radio astronomy):
   1. Detect: grid search over (φ, d) for the geometric mean across mics of
      the matched-filter envelope at the predicted echo delays (every mic must
      see the echo where the wall predicts it).
-  2. Fit: maximise the echo energy explained by the wall — per mic, a
+  2. Fit: for the strongest grid peak in each 30° sector of wall angle,
+     maximise the echo energy explained by the wall; keep the best — per mic, a
      least-squares fit of the analytic pulse shape at the predicted delays of
      the wall echo and its 'twin' via each known wall (TX → wall → mounting
      wall → mic, ≈ 2·5 cm later or merged). A free complex amplitude per mic
@@ -146,40 +147,44 @@ def _score_grid(env, mic_pos, fs, c, tx, PHI, D, known_walls, floor):
 TWIN_RATIOS = (0.0, 0.35, 0.7, 1.0)
 
 
-def _fit_echoes(z, mic_pos, fs, c, pulse, imgs, margin, twin_ratios=TWIN_RATIOS):
+def _fit_echoes(z, mic_pos, fs, c, pulse, imgs, margin, twin_ratios=TWIN_RATIOS,
+                want_model=True):
     """Fit the wall's echo at every mic: shape = pulse at the first-order
     delay + β · pulse at each twin delay, one complex amplitude per mic.
     β (twin/primary ratio, physically ≈ the known wall's reflection
     coefficient) is shared by all mics and picked from twin_ratios — free
     per-mic twin amplitudes would let a wrong angle 'fit' a merged echo.
-    Returns (explained_energy, model (n_mics, n) complex, amps)."""
-    segs = []
-    for mp in mic_pos:
-        taus = [np.linalg.norm(q - mp) / c * fs for q in imgs]
-        lo = max(int(min(taus)) - margin, 0)
-        hi = min(int(max(taus)) + margin + 1, z.shape[1])
-        if hi - lo < 4:
-            return 0.0, np.zeros_like(z), None
-        k = np.arange(lo, hi)
-        segs.append((lo, hi, pulse(k - taus[0]),
-                     sum(pulse(k - t) for t in taus[1:]) if len(taus) > 1 else 0))
+    Vectorised over mics (it is the inner loop of the wall search).
+    Returns (explained_energy, model (n_mics, n) complex or None, amps)."""
+    imgs = np.asarray(imgs, float)                              # (n_img, 2)
+    taus = np.linalg.norm(imgs[:, None, :] - mic_pos[None], axis=2) / c * fs   # (n_img, n_mics)
+    lo = np.maximum(taus.min(0).astype(int) - margin, 0)
+    hi = np.minimum(taus.max(0).astype(int) + margin + 1, z.shape[1])
+    if np.any(hi - lo < 4):
+        return 0.0, (np.zeros_like(z) if want_model else None), None
+    K = lo[:, None] + np.arange(int((hi - lo).max()))[None]     # (n_mics, L)
+    valid = K < hi[:, None]
+    Kc = np.minimum(K, z.shape[1] - 1)
+    P0 = pulse(K - taus[0][:, None]) * valid
+    PT = sum((pulse(K - t[:, None]) for t in taus[1:]), np.zeros_like(P0)) * valid
+    Y = np.take_along_axis(z, Kc, axis=1) * valid
     best = None
     for beta in (twin_ratios if len(imgs) > 1 else (0.0,)):
-        explained, parts = 0.0, []
-        for i, (lo, hi, p0, pt) in enumerate(segs):
-            t = p0 + beta * pt
-            y = z[i, lo:hi]
-            tt = float(np.vdot(t, t).real)
-            a = np.vdot(t, y) / tt if tt > 0 else 0.0
-            explained += abs(np.vdot(t, y))**2 / tt if tt > 0 else 0.0
-            parts.append((lo, hi, a * t, a))
-        if best is None or explained > best[0]:
-            best = (explained, parts)
-    explained, parts = best
-    model = np.zeros_like(z)
-    for i, (lo, hi, fit, _) in enumerate(parts):
-        model[i, lo:hi] = fit
-    return explained, model, [np.atleast_1d(a) for *_, a in parts]
+        T = P0 + beta * PT
+        tt = np.sum(np.abs(T)**2, axis=1)
+        ty = np.sum(np.conj(T) * Y, axis=1)
+        ok = tt > 0
+        e = float(np.sum(np.abs(ty[ok])**2 / tt[ok]))
+        if best is None or e > best[0]:
+            best = (e, T, np.where(ok, ty / np.where(ok, tt, 1.0), 0.0))
+    explained, T, a = best
+    model = None
+    if want_model:
+        model = np.zeros_like(z)
+        for i in range(len(mic_pos)):
+            v = valid[i]
+            model[i, K[i, v]] = a[i] * T[i, v]
+    return explained, model, [np.atleast_1d(x) for x in a]
 
 
 # ──────────────────────────────── mapping ─────────────────────────────────────
@@ -187,8 +192,8 @@ def find_walls(z, mic_pos, tx_pos, fs, c, tx_pulse, ref, known_walls=(),
                blank_m=0.9, d_min=0.45, d_max=None,
                dd=0.01, dphi_deg=1.0, max_walls=10,
                rel_threshold=0.25, noise_factor=8.0,
-               higher_order_tol_m=0.15, rectilinear=True, snap_deg=8.0,
-               fit_halfwidth_m=0.15, debug=False):
+               higher_order_tol_m=0.15, rectilinear=True, snap_deg=30.0, snap_keep=0.8,
+               fit_halfwidth_m=0.15, n_candidates=8, cand_rel=0.6, debug=False):
     """
     Detect walls from the static echo profile.
 
@@ -202,10 +207,16 @@ def find_walls(z, mic_pos, tx_pos, fs, c, tx_pulse, ref, known_walls=(),
     rel_threshold: stop when the best remaining detection, compensated for
                  spherical spreading (× path length), drops below this
                  fraction of the first (strongest) one.
-    rectilinear: snap angles within snap_deg of a multiple of 90° to the
-                 first known wall (rectangular-room prior) and re-fit d.
+    rectilinear: rectangular-room prior — a wall within snap_deg of a right
+                 angle to the first known wall (or, with none, to the first
+                 detected wall) is snapped to it if the snapped wall still
+                 explains ≥ snap_keep of the echo energy.
     fit_halfwidth_m: ± window (path metres) around each predicted echo used
                  for the amplitude fit and the subtraction.
+    n_candidates, cand_rel: per step, up to n_candidates grid peaks (one
+                 per 30° of wall angle, ≥ cand_rel × the strongest) are
+                 refined; the one explaining the most echo energy is the
+                 next wall.
     """
     known_walls = list(known_walls)
     z = np.array(z, complex)
@@ -217,8 +228,10 @@ def find_walls(z, mic_pos, tx_pos, fs, c, tx_pulse, ref, known_walls=(),
     if d_max is None:
         d_max = (z.shape[1] / fs * c) / 2 - 0.05
     centre = mic_pos.mean(axis=0)
+    # rectangular-room prior: right angles relative to the first known wall,
+    # or (free-standing array) to the strongest detected wall
     ref_ang = (np.arctan2(known_walls[0].normal[1], known_walls[0].normal[0])
-               if known_walls else 0.0)
+               if known_walls else None)
 
     d   = np.arange(d_min, d_max, dd)
     phi = np.radians(np.arange(-180.0, 180.0, dphi_deg))
@@ -230,7 +243,8 @@ def find_walls(z, mic_pos, tx_pos, fs, c, tx_pulse, ref, known_walls=(),
         if not _in_front(tx_pos, ph, dist, known_walls) or dist < d_min * 0.5:
             return 0.0
         return _fit_echoes(zr, mic_pos, fs, c, pulse,
-                           _images(tx_pos, ph, dist, known_walls), margin)[0]
+                           _images(tx_pos, ph, dist, known_walls), margin,
+                           want_model=False)[0]
 
     found, first_level = [], None
     for _ in range(max_walls):
@@ -243,29 +257,61 @@ def find_walls(z, mic_pos, tx_pos, fs, c, tx_pulse, ref, known_walls=(),
         if level[j] < rel_threshold * first_level or score[j] < noise_factor * noise:
             break
 
-        # refine (φ, d) by maximising the explained echo energy
-        x0 = np.array([PHI[j], D[j]])
-        res = scipy.optimize.minimize(
-            lambda x: -explained(x[0], x[1], z), x0, method="Nelder-Mead",
-            options=dict(xatol=1e-5, fatol=1e-9 * np.vdot(z, z).real,
-                         initial_simplex=[x0, x0 + [np.radians(2.0), 0],
-                                          x0 + [0, 0.01]]))
-        ph, dist = res.x
-        raw_deg = float(np.degrees(ph))
+        # The grid score only looks at envelopes, and with a small array the
+        # echo delays barely depend on the wall angle — the same echo can be
+        # 'explained' by a wrong wall (e.g. the wall ahead as a side wall
+        # whose twin lines up). So take the best grid peak in each 30° sector
+        # of wall angle, refine the strong ones by maximising the explained
+        # echo energy (exact pulse shape, all mics coherently) and keep the
+        # best explanation.
+        sector = (np.degrees(phi) // 30).astype(int)
+        cands = []
+        for sct in np.unique(sector):
+            sub = np.where(sector == sct, level, -1.0)
+            k = np.unravel_index(np.argmax(sub), sub.shape)
+            if sub[k] >= cand_rel * level[j] and score[k] >= noise_factor * noise:
+                cands.append(k)
+        cands = sorted(cands, key=lambda k: -level[k])[:n_candidates]
+        fatol = 1e-9 * np.vdot(z, z).real
+        best = None                                  # (energy, φ, d, raw φ)
+        for k in cands:
+            x0 = np.array([PHI[k], D[k]])
+            res = scipy.optimize.minimize(
+                lambda x: -explained(x[0], x[1], z), x0, method="Nelder-Mead",
+                options=dict(xatol=1e-5, fatol=fatol,
+                             initial_simplex=[x0, x0 + [np.radians(2.0), 0],
+                                              x0 + [0, 0.01]]))
+            ph, dist, e = res.x[0], res.x[1], -res.fun
+            cand = (e, ph, dist, ph)
+            # rectangular-room prior: take the nearest right angle if it
+            # explains nearly as much — how much a wrong angle costs depends
+            # on the array, so a small array (flat in angle) snaps readily
+            # while a large one can still report a slanted wall
+            if rectilinear and ref_ang is not None:
+                rel = np.degrees(ph - ref_ang)
+                snapped = 90.0 * np.round(rel / 90.0)
+                if abs((rel - snapped + 180) % 360 - 180) <= snap_deg:
+                    phs = ref_ang + np.radians(snapped)
+                    r1 = scipy.optimize.minimize_scalar(
+                        lambda x: -explained(phs, x, z),
+                        bounds=(dist - 0.08, dist + 0.08), method="bounded",
+                        options=dict(xatol=1e-5))
+                    if -r1.fun >= snap_keep * e:
+                        cand = (-r1.fun, phs, float(r1.x), ph)
+            if debug:
+                print(f"  [clean]   cand φ={np.degrees(x0[0]):7.1f}° d={x0[1]:.3f} "
+                      f"level={level[k]:.2f} → φ={np.degrees(ph):7.2f}° d={dist:.3f} "
+                      f"explained {e:.3g}"
+                      + (f" | snapped φ={np.degrees(cand[1]):7.2f}° {cand[0]:.3g}"
+                         if cand[1] != ph else ""))
+            if best is None or cand[0] > best[0]:
+                best = cand
+        _, ph, dist, raw = best
+        raw_deg = float(np.degrees(raw))
+        if rectilinear and ref_ang is None:
+            ref_ang = ph                             # first wall sets the axes
         if debug:
-            print(f"  [clean] grid φ={np.degrees(x0[0]):7.1f}° d={x0[1]:.3f} "
-                  f"level={level[j]:.2f} score={score[j]:.3f} → NM φ={raw_deg:7.2f}° "
-                  f"d={dist:.3f} explained {-res.fun:.3g} (start {explained(*x0, z):.3g})")
-        if rectilinear:
-            rel = np.degrees(ph - ref_ang)
-            snapped = 90.0 * np.round(rel / 90.0)
-            if abs((rel - snapped + 180) % 360 - 180) <= snap_deg:
-                ph = ref_ang + np.radians(snapped)
-                r1 = scipy.optimize.minimize_scalar(
-                    lambda x: -explained(ph, x, z),
-                    bounds=(dist - 0.05, dist + 0.05), method="bounded",
-                    options=dict(xatol=1e-5))
-                dist = float(r1.x)
+            print(f"  [clean] → wall φ={np.degrees(ph):7.2f}° d={dist:.3f}")
 
         imgs = _images(tx_pos, ph, dist, known_walls)
         e, model, amps = _fit_echoes(z, mic_pos, fs, c, pulse, imgs, margin)

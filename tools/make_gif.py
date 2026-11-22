@@ -3,6 +3,8 @@
 
     python tools/make_gif.py            # 10 s of tracking after calibration
     python tools/make_gif.py --frames 150 --seed 3
+    python tools/make_gif.py --out ring.gif -- --array ring8 --pose 1.5 0 90
+                                         # args after -- go to simulator.py
 """
 import argparse
 import contextlib
@@ -17,10 +19,11 @@ ap.add_argument("--frames", type=int, default=100, help="frames to record (10 pe
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--width", type=int, default=960, help="GIF width in pixels")
 ap.add_argument("--out", default=os.path.join(ROOT, "docs", "simulation.gif"))
+ap.add_argument("sim_args", nargs="*", help="extra simulator.py arguments (after --)")
 args = ap.parse_args()
 
 # --eval selects the non-interactive backend and synchronous wall mapping
-sys.argv = ["simulator.py", "--eval", "1", "--seed", str(args.seed)]
+sys.argv = ["simulator.py", "--eval", "1", "--seed", str(args.seed), *args.sim_args]
 sys.path.insert(0, ROOT)
 with contextlib.redirect_stdout(io.StringIO()):
     import simulator as S
