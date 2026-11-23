@@ -305,9 +305,16 @@ provide a synchronized transmit sample or calibrated positions.
 
 The Python GUI streams all six microphones over ADB, synchronizes to the chirps,
 and shows background-subtracted changes and experimental candidate positions.
-It is a separate, simplified tracker, not the simulator's full tracking or
-room-mapping pipeline. Positions, timing and the supplied geometry are
-uncalibrated; off-axis detection and real-world accuracy remain unvalidated.
+It runs `AudiodeviceMapper` (through `audiodevice_mapper.LiveMapper`), the
+same tracker `audiodevice_recording.py replay` scores, on the 3 front mics. Its
+range and angle were calibrated against a LiDAR on one recording (walk1:
+lateral error median 0.22 m, p90 0.56 m). Accuracy elsewhere is unvalidated.
+The trace panel shows each front mic's echo (change from the background) by
+echo path from the speaker. The map shows the mapper's change evidence out to
+4 m, with the facing wall as a dashed line. The wall's depth comes from the
+background's strongest echo; it is the one wall the 3-mic line can place
+reliably. Walls, chairs and other static objects are otherwise subtracted as
+background, which is why the map shows only what moves.
 
 Use the same device, routing and safety prerequisites as the capture
 experiment above. From this directory, after running `./setupenv.sh`:
@@ -397,11 +404,16 @@ synthetic audio of the real room and the real walk:
 .venv/bin/python audiodevice_recording.py replay recordings/walk1_sim
 .venv/bin/python recording_sim.py recordings/walk1 --no-fade --seed 3   # ablations, other noise draws
 .venv/bin/python compare_view.py recordings/walk1                       # recording vs simulation, side by side
+.venv/bin/python compare_view.py recordings/walk1 --no-sim              # the recording only
 ```
 
 `compare_view.py` replays both through the mapper with the LiDAR walker as
-ground truth: the scene, range over time and the range profiles, in sync.
-Keys: space pauses, ←/→ jump 1 s, +/- change speed, and the slider scrubs.
+ground truth: the scene, range over time, each front mic's echo (the change
+from the empty-room background, in units of that mic's noise, as in
+`audiodevice_live.py`) and the range profiles, in sync.
+It loops over the walking part by default; `l` toggles looping and
+`--no-loop` plays the whole recording once. Keys: space pauses, ←/→ jump 1 s,
++/- change speed, and the slider scrubs.
 
 Where each part of the model comes from:
 
@@ -488,8 +500,7 @@ correlation fell from +0.24 to +0.14 (an offline test of the angle step alone).
 The rear mics alone carry no angle information for any of the 6 ways they could
 sit behind the front ones. They are 3.5 cm behind the front mics and add no
 lateral aperture. The browser and
-Matplotlib GUIs still use the separate live tracker in `audiodevice_tracking.py`,
-not the mapper.
+Matplotlib GUIs run the mapper too (through `audiodevice_mapper.LiveMapper`).
 
 ## Lidar viewer
 

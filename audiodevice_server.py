@@ -19,11 +19,12 @@ import numpy as np
 import audiodevice_capture as capture
 import audiodevice_live_audio as audio
 import audiodevice_lidar as lidar
+import audiodevice_mapper as mapper
 import audiodevice_tracking as tracker
 
 
 PAGE = Path(__file__).resolve().parent / "audiodevice_server.html"
-TRACE_COUNT = min(tracker.PERIOD, int(6 * capture.RATE / tracker.SPEED_OF_SOUND))
+TRACE_COUNT = min(mapper.WINDOW, int(9.0 * capture.RATE / tracker.SPEED_OF_SOUND))
 TRACE_BIN = 2
 KEEPALIVE_SECONDS = 10
 CONTROL_HEADER = "X-Audiodevice-Control"
@@ -38,6 +39,8 @@ def frame_payload(frame):
         "support": frame.support,
         "threshold": None if frame.threshold is None else round(frame.threshold, 3),
         "position": None if frame.position is None else [round(v, 3) for v in frame.position],
+        "facing_wall_m": (None if frame.facing_wall_m is None or not np.isfinite(frame.facing_wall_m)
+                          else round(float(frame.facing_wall_m), 3)),
         "traces": None,
         "scores": None,
     }
@@ -87,7 +90,7 @@ class LiveSession:
         return self._config
 
     def _make_config(self):
-        model = tracker.AudiodeviceTracker(*self.band)
+        model = mapper.LiveMapper(*self.band)
         return {
             "serial": self.serial, "band": self.band, "level": self.level,
             "duration": self.duration,
@@ -231,7 +234,7 @@ class LiveSession:
     def _run(self):
         final, error = "", False
         try:
-            model = tracker.AudiodeviceTracker(*self.band)
+            model = mapper.LiveMapper(*self.band)
             synchronized = calibrated = False
 
             def on_status(text):

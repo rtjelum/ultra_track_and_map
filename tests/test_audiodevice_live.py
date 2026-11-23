@@ -89,7 +89,7 @@ class AudiodeviceLiveTests(unittest.TestCase):
         model.push.return_value = [tracking.TrackingFrame("calibrating", 6.0, 1)]
         app = gui.LiveDemo("serial", (18000, 22000), 1, 5)
         try:
-            with (patch.object(tracking, "AudiodeviceTracker", return_value=model),
+            with (patch.object(gui.mapper, "LiveMapper", return_value=model),
                   patch.object(audio, "stream", side_effect=fake_stream)):
                 app.start()
                 app.worker.join(timeout=3)

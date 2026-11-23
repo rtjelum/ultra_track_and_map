@@ -16,10 +16,12 @@ from matplotlib.widgets import Button
 
 import audiodevice_capture as capture
 import audiodevice_live_audio as audio
+import audiodevice_mapper as mapper
 import audiodevice_tracking as tracker
 
 
 COLORS = ("#ffae42", "#fa6d6d", "#8bd17c", "#44c2ad", "#89aaff", "#d599f0")
+TRACE_PATH_M = 9.0      # echo path shown in the trace panel (≈ 4.5 m range)
 
 
 connected_serial = capture.connected_serial
@@ -41,12 +43,12 @@ class LiveDemo:
         self.closed = False
         self.history = deque(maxlen=30)
 
-        model = tracker.AudiodeviceTracker(*band)
+        model = mapper.LiveMapper(*band)
         self.figure = plt.figure(figsize=(13, 7.5), facecolor="#101722")
         self.figure.suptitle("Audiodevice live chirp tracker — EXPERIMENTAL",
                              color="white", fontsize=15, y=0.97)
         grid = self.figure.add_gridspec(
-            2, 2, left=0.07, right=0.97, bottom=0.18, top=0.88,
+            2, 2, left=0.07, right=0.97, bottom=0.22, top=0.90,
             width_ratios=(1.0, 1.15), height_ratios=(1.0, 0.75),
             wspace=0.25, hspace=0.30,
         )
@@ -66,7 +68,8 @@ class LiveDemo:
             origin="lower", extent=extent, cmap="magma", vmin=0, vmax=2,
             interpolation="nearest", alpha=0.8, aspect="auto",
         )
-        self.map_axis.plot([-0.19, 0.24], [0, 0], color="#e2e8f0", linewidth=4)
+        bar = np.r_[tracker.MIC_POSITIONS[:, 1], tracker.TX_POSITION[1]]
+        self.map_axis.plot([bar.min(), bar.max()], [0, 0], color="#e2e8f0", linewidth=4)
         self.map_axis.scatter(tracker.MIC_POSITIONS[:, 1], tracker.MIC_POSITIONS[:, 0],
                               color="#4cd1bf", s=32, label="Microphones")
         self.map_axis.scatter([tracker.TX_POSITION[1]], [tracker.TX_POSITION[0]],
@@ -75,6 +78,11 @@ class LiveDemo:
                                          linewidth=1.5, label="Recent candidates")
         self.marker, = self.map_axis.plot([], [], "o", color="#40dcff", markersize=11,
                                           markeredgecolor="white", label="Candidate")
+        self.wall = self.map_axis.axhline(np.nan, color="#f2a7c3", linestyle="--",
+                                          linewidth=2, label="Facing wall")
+        self.wall_text = self.map_axis.text(0.02, 0.0, "", color="#f2a7c3", fontsize=9,
+                                            transform=self.map_axis.get_yaxis_transform(),
+                                            va="bottom")
         self.map_axis.set_xlim(model.laterals[0], model.laterals[-1])
         self.map_axis.set_ylim(-0.15, model.depths[-1])
         self.map_axis.set_aspect("equal", adjustable="box")
@@ -83,7 +91,7 @@ class LiveDemo:
         self.map_axis.set_title("Change evidence — not a room map", color="white")
         self.map_axis.legend(loc="upper right", fontsize=7, framealpha=0.75)
 
-        self.trace_count = min(tracker.PERIOD, int(6 * capture.RATE / tracker.SPEED_OF_SOUND))
+        self.trace_count = min(mapper.WINDOW, int(TRACE_PATH_M * capture.RATE / tracker.SPEED_OF_SOUND))
         self.trace_x = np.arange(self.trace_count) * tracker.SPEED_OF_SOUND / capture.RATE
         self.lines = []
         for ch, color in enumerate(COLORS):
@@ -91,7 +99,7 @@ class LiveDemo:
             self.lines.append(line)
         self.signal_axis.set_xlim(0, self.trace_x[-1])
         self.signal_axis.set_ylim(0, 1.05)
-        self.signal_axis.set_xlabel("Excess path from reference mic (m)", color="white")
+        self.signal_axis.set_xlabel("Echo path from the speaker (m)", color="white")
         self.signal_axis.set_ylabel("Per-mic normalized envelope", color="white")
         self.signal_axis.set_title("Matched-filter response", color="white")
         self.signal_axis.grid(alpha=0.2)
@@ -132,14 +140,14 @@ class LiveDemo:
         lines = [
             f"Device: {self.serial}",
             "Remove the moving target during calibration.",
-            "Position estimates use supplied geometry and an",
-            "assumed direct-path timing reference; they are",
-            "not calibrated or ground truth. Hotter colors",
+            "Tracking: AudiodeviceMapper on the front mics,",
+            "range and angle calibrated against a LiDAR on one",
+            "recording (walk1); not ground truth. Hotter colors",
             "indicate stronger change, not a room map.",
         ]
         if frame is not None:
-            lines.extend(("", f"Sync peak / median: {frame.sync_ratio:.1f}",
-                          f"Channels supporting peak: {frame.support} / 6"))
+            lines.extend(("", f"Chirp lock: {frame.sync_ratio:.2f}",
+                          f"Front mics used: {frame.support} / 3"))
             if frame.position is not None:
                 depth, lateral = frame.position
                 lines.append(f"Candidate: {depth:.2f} m forward, {lateral:+.2f} m right")
@@ -169,7 +177,7 @@ class LiveDemo:
     def _run(self):
         reported = False
         try:
-            model = tracker.AudiodeviceTracker(*self.band)
+            model = mapper.LiveMapper(*self.band)
             synchronized = False
             calibrated = False
 
@@ -230,12 +238,37 @@ class LiveDemo:
         self.status.set_text("Stopping playback and restoring the device...")
         self.figure.canvas.draw_idle()
 
+    def _keep_in_view(self, depth, lateral, margin=0.3):
+        """Grow the map (never shrink it) so the estimate stays in frame."""
+        x0, x1 = self.map_axis.get_xlim()
+        y0, y1 = self.map_axis.get_ylim()
+        nx = (min(x0, lateral - margin), max(x1, lateral + margin))
+        ny = (y0, max(y1, depth + margin))
+        if (nx, ny) != ((x0, x1), (y0, y1)):
+            self.map_axis.set_xlim(*nx)
+            self.map_axis.set_ylim(*ny)
+
+    def _show_wall(self, depth):
+        if depth is None or not np.isfinite(depth):
+            self.wall.set_ydata([np.nan, np.nan])
+            self.wall_text.set_text("")
+            return
+        self._keep_in_view(depth, 0.0)
+        self.wall.set_ydata([depth, depth])
+        self.wall_text.set_position((0.02, depth + 0.03))
+        self.wall_text.set_text(f"facing wall {depth:.2f} m")
+
     def _show_frame(self, frame):
         self._set_info(frame)
+        if frame.facing_wall_m is not None or frame.state == "syncing":
+            self._show_wall(frame.facing_wall_m)
         if frame.envelopes is not None:
             for ch, line in enumerate(self.lines):
                 envelope = frame.envelopes[:self.trace_count, ch]
                 maximum = float(np.max(envelope))
+                if maximum <= 0:                  # a mic the tracker doesn't use
+                    line.set_data([], [])
+                    continue
                 line.set_data(self.trace_x, envelope / maximum if maximum > 0 else envelope)
             self.signal_axis.set_title(
                 "Matched-filter response" if frame.state == "calibrating"
@@ -253,6 +286,7 @@ class LiveDemo:
             self._clear_position(clear_history=frame.state in ("syncing", "calibrating"))
         else:
             depth, lateral = frame.position
+            self._keep_in_view(depth, lateral)
             self.marker.set_color("#ffae42" if frame.state == "candidate" else "#40dcff")
             self.marker.set_data([lateral], [depth])
             self.history.append((lateral, depth))

@@ -52,7 +52,7 @@
       <label><input id="show-heat" type="checkbox" checked> Ultrasound evidence</label>
       <label><input id="show-lidar" type="checkbox" checked> LiDAR returns</label>
       <label><input id="show-trail" type="checkbox" checked> Candidate trail</label>
-      <label>View radius (m) <select id="view-range"><option>3</option><option>6</option><option>12</option></select></label>
+      <label>View radius (m) <select id="view-range"><option value="auto" selected>Auto</option><option>3</option><option>6</option><option>12</option></select></label>
     </div>
     <canvas id="map" width="640" height="600"></canvas>
     <div class="legend">
@@ -105,6 +105,7 @@ const COLORS = ["#ffae42", "#fa6d6d", "#8bd17c", "#44c2ad", "#89aaff", "#d599f0"
 const MAGMA = [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],[245,125,21],[250,193,39],[252,253,191]];
 const $ = id => document.getElementById(id);
 let cfg = null, frame = null, history = [], status = {running: false, stopping: false};
+let wallDepth = null;
 let scan = null, scanReceived = 0, connected = false;
 let lidarStatus = {running: false, stopping: false, error: false, text: "Not configured"};
 
@@ -122,12 +123,54 @@ function magma(t) {
   return [0, 1, 2].map(k => Math.round(a[k] + (b[k] - a[k]) * f));
 }
 
+function lidarVisible() {
+  return $("show-lidar").checked && scan && connected && performance.now() - scanReceived < 1500;
+}
+
+function quantile(sorted, q) {
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))))];
+}
+
+// "Auto" view: the device, the tracker's grid, the trail and the bulk of the
+// current LiDAR scan, with a margin. It grows at once and shrinks slowly.
+let autoView = null;
+function autoBounds() {
+  const b = {lat0: cfg.laterals[0], lat1: cfg.laterals[cfg.laterals.length - 1],
+             dep0: -0.15, dep1: cfg.depths[cfg.depths.length - 1]};
+  const add = (d, l) => {
+    b.lat0 = Math.min(b.lat0, l); b.lat1 = Math.max(b.lat1, l);
+    b.dep0 = Math.min(b.dep0, d); b.dep1 = Math.max(b.dep1, d);
+  };
+  history.forEach(([d, l]) => add(d, l));
+  if (frame && frame.position) add(...frame.position);
+  if (lidarVisible()) {
+    const pts = scan.points.filter(p => p[2] > 0).map(lidarPoint).filter(p => p);
+    if (pts.length > 10) {
+      const ds = pts.map(p => p[0]).sort((a, b) => a - b), ls = pts.map(p => p[1]).sort((a, b) => a - b);
+      add(quantile(ds, 0.02), quantile(ls, 0.02)); add(quantile(ds, 0.98), quantile(ls, 0.98));
+    }
+  }
+  const pad = 0.25;
+  if (wallDepth !== null) add(wallDepth, 0);
+  const want = {lat0: b.lat0 - pad, lat1: b.lat1 + pad, dep0: b.dep0 - pad, dep1: b.dep1 + pad};
+  if (!autoView) autoView = want;
+  for (const k of ["lat0", "dep0"]) autoView[k] = want[k] < autoView[k] ? want[k] : autoView[k] + 0.05 * (want[k] - autoView[k]);
+  for (const k of ["lat1", "dep1"]) autoView[k] = want[k] > autoView[k] ? want[k] : autoView[k] + 0.05 * (want[k] - autoView[k]);
+  return autoView;
+}
+
 function mapGeometry(canvas) {
-  const radius = Number($("view-range").value);
-  const lat0 = cfg.lidar_port ? -radius : cfg.laterals[0];
-  const lat1 = cfg.lidar_port ? radius : cfg.laterals[cfg.laterals.length - 1];
-  const dep0 = cfg.lidar_port ? -radius : -0.15;
-  const dep1 = cfg.lidar_port ? radius : cfg.depths[cfg.depths.length - 1];
+  const choice = $("view-range").value;
+  let lat0, lat1, dep0, dep1;
+  if (choice === "auto") {
+    ({lat0, lat1, dep0, dep1} = autoBounds());
+  } else {
+    const radius = Number(choice);
+    lat0 = cfg.lidar_port ? -radius : cfg.laterals[0];
+    lat1 = cfg.lidar_port ? radius : cfg.laterals[cfg.laterals.length - 1];
+    dep0 = cfg.lidar_port ? -radius : -0.15;
+    dep1 = cfg.lidar_port ? radius : cfg.depths[cfg.depths.length - 1];
+  }
   const pad = {l: 52, r: 10, t: 10, b: 44};
   const w = canvas.width - pad.l - pad.r, h = canvas.height - pad.t - pad.b;
   const scale = Math.min(w / (lat1 - lat0), h / (dep1 - dep0));
@@ -159,7 +202,8 @@ function drawMap() {
   // Axes.
   g.strokeStyle = "#718096"; g.lineWidth = 1;
   g.strokeRect(m.x(m.lat0), m.y(m.dep1), (m.lat1 - m.lat0) * m.scale, (m.dep1 - m.dep0) * m.scale);
-  const tick = cfg.lidar_port ? Math.max(1, Number($("view-range").value) / 3) : 0.5;
+  const span = Math.max(m.lat1 - m.lat0, m.dep1 - m.dep0);
+  const tick = span > 12 ? 2 : span > 5 ? 1 : 0.5;
   g.fillStyle = "#dce4ec"; g.font = "14px system-ui"; g.textAlign = "center";
   for (let v = Math.ceil(m.lat0 / tick) * tick; v <= m.lat1 + 1e-6; v += tick)
     g.fillText(v.toFixed(1), m.x(v), m.y(m.dep0) + 17);
@@ -170,7 +214,7 @@ function drawMap() {
   g.fillText("Left / right of device centre (m)", m.x(0), c.height - 6);
   g.save(); g.translate(14, m.y((m.dep0 + m.dep1) / 2)); g.rotate(-Math.PI / 2);
   g.fillText("Forward / behind device (m)", 0, 0); g.restore();
-  if ($("show-lidar").checked && scan && connected && performance.now() - scanReceived < 1500) {
+  if (lidarVisible()) {
     g.save();
     g.beginPath();
     g.rect(m.x(m.lat0), m.y(m.dep1), (m.lat1 - m.lat0) * m.scale, (m.dep1 - m.dep0) * m.scale);
@@ -189,11 +233,19 @@ function drawMap() {
   }
   // Device bar, microphones and speaker.
   g.strokeStyle = "#e2e8f0"; g.lineWidth = 4;
-  g.beginPath(); g.moveTo(m.x(-0.19), m.y(0)); g.lineTo(m.x(0.24), m.y(0)); g.stroke();
+  const bar = cfg.mics.map(p => p[1]).concat([cfg.speaker[1]]);
+  g.beginPath(); g.moveTo(m.x(Math.min(...bar)), m.y(0)); g.lineTo(m.x(Math.max(...bar)), m.y(0)); g.stroke();
   g.fillStyle = "#4cd1bf";
   cfg.mics.forEach(([d, l]) => { g.beginPath(); g.arc(m.x(l), m.y(d), 3.5, 0, 2 * Math.PI); g.fill(); });
   g.fillStyle = "#ffd36b"; g.font = "18px system-ui";
   g.fillText("★", m.x(cfg.speaker[1]), m.y(cfg.speaker[0]) + 6);
+  // Facing wall (from the background's strongest echo), kept until the next sync.
+  if (wallDepth !== null && wallDepth >= m.dep0 && wallDepth <= m.dep1) {
+    g.save(); g.strokeStyle = "#f2a7c3"; g.lineWidth = 2; g.setLineDash([8, 6]);
+    g.beginPath(); g.moveTo(m.x(m.lat0), m.y(wallDepth)); g.lineTo(m.x(m.lat1), m.y(wallDepth)); g.stroke();
+    g.restore(); g.fillStyle = "#f2a7c3"; g.font = "13px system-ui"; g.textAlign = "left";
+    g.fillText(`facing wall ${wallDepth.toFixed(2)} m`, m.x(m.lat0) + 6, m.y(wallDepth) - 5);
+  }
   // Trail and current candidate.
   if ($("show-trail").checked && history.length > 1) {
     g.strokeStyle = "rgba(76,209,255,0.65)"; g.lineWidth = 1.5; g.beginPath();
@@ -229,9 +281,10 @@ function drawTraces() {
     g.fillText(y.toFixed(2), pad.l - 4, Y(y) + 4);
   }
   g.textAlign = "center"; g.fillStyle = "white";
-  g.fillText("Excess path from reference mic (m) — per-mic normalized envelope", pad.l + w / 2, c.height - 6);
+  g.fillText("Echo path from the speaker (m) — per-mic normalized envelope", pad.l + w / 2, c.height - 6);
   if (!frame || !frame.traces) return;
   frame.traces.forEach((trace, ch) => {
+    if (!trace.some(v => v > 0)) return;   // a mic the tracker doesn't use
     g.strokeStyle = COLORS[ch]; g.lineWidth = 1; g.beginPath();
     trace.forEach((v, i) => i ? g.lineTo(X(i * cfg.trace_spacing_m), Y(v)) : g.moveTo(X(0), Y(v)));
     g.stroke();
@@ -248,13 +301,13 @@ const STATE_TEXT = {
 function render() {
   const lines = [
     `Device: ${cfg ? cfg.serial : "?"}`,
-    "Remove the moving target during calibration. Position estimates use supplied " +
-    "geometry and an assumed direct-path timing reference; they are not calibrated " +
-    "or ground truth. Hotter colors indicate stronger change, not a room map.",
+    "Remove the moving target during calibration. Tracking: AudiodeviceMapper on the " +
+    "front mics, range and angle calibrated against a LiDAR on one recording (walk1); " +
+    "not ground truth. Hotter colors indicate stronger change, not a room map.",
   ];
   if (frame) {
-    lines.push("", `Sync peak / median: ${frame.sync_ratio.toFixed(1)}`,
-               `Channels supporting peak: ${frame.support} / 6`);
+    lines.push("", `Chirp lock: ${frame.sync_ratio.toFixed(2)}`,
+               `Front mics used: ${frame.support} / 3`);
     if (frame.position) {
       const [d, l] = frame.position;
       lines.push(`Candidate: ${d.toFixed(2)} m forward, ${l >= 0 ? "+" : ""}${l.toFixed(2)} m right`);
@@ -289,6 +342,8 @@ function setStatus(text, error) {
 
 function onFrame(f) {
   frame = f;
+  if (f.facing_wall_m !== undefined && f.facing_wall_m !== null) wallDepth = f.facing_wall_m;
+  else if (f.state === "syncing") wallDepth = null;
   if (f.position) {
     history.push(f.position);
     if (history.length > 30) history.shift();
@@ -336,7 +391,7 @@ async function init() {
     status = JSON.parse(e.data); setStatus(status.text, status.error); scheduleRender();
   });
   events.addEventListener("frame", e => onFrame(JSON.parse(e.data)));
-  events.addEventListener("reset", () => { frame = null; history = []; scheduleRender(); });
+  events.addEventListener("reset", () => { frame = null; history = []; wallDepth = null; scheduleRender(); });
   events.addEventListener("lidar", e => {
     scan = JSON.parse(e.data); scanReceived = performance.now(); scheduleRender();
   });

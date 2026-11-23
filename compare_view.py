@@ -5,13 +5,20 @@ with the LiDAR as ground truth.
 
     python compare_view.py recordings/walk1                 # vs recordings/walk1_sim
     python compare_view.py recordings/walk1 --sim other_sim --speed 2
+    python compare_view.py recordings/walk1 --no-sim        # the recording only
 
-Keys: space pause · ←/→ ∓1 s · +/- speed · drag the time slider · q quit
+Keys: space pause · ←/→ ∓1 s · +/- speed · l loop on/off · drag the time slider · q quit
+
+By default it loops over the walking part (from 1 s before the LiDAR walker
+appears to 1 s after they leave); --no-loop plays the whole recording once.
 
 Both recordings are tracked first (a few seconds), then played back in sync.
 Panels: the scene for each (LiDAR now, walker truth and trail, mapper
-estimate and trail, facing wall), range over time, and the mapper's
-integrated range profile with its detection threshold.
+estimate and trail, facing wall), range over time, the echo on each mic
+(change from the empty-room background, in units of that mic's noise, as in
+audiodevice_live.py; green ticks: where the LiDAR walker's echo should be on
+that mic, triangles: the mapper's estimate) and the mapper's integrated range
+profile with its detection threshold.
 """
 
 import argparse
@@ -33,7 +40,8 @@ def run_mapper(rec):
     """Mapper over a whole recording → per-ping arrays."""
     low, high = rec.meta.get("band_hz", (18_000, 22_000))
     mapper = M.AudiodeviceMapper(low, high, angle_offset_deg=R.angle_offset(rec))
-    t, state, pos, score, thr, prof, wall = [], [], [], [], [], [], []
+    t, state, pos, score, thr, prof, wall, env = [], [], [], [], [], [], [], []
+    blank = np.full((M.WINDOW, len(mapper.channels)), np.nan, np.float32)
     for _, chunk in rec.chunks():
         for f in mapper.push(chunk):
             if f.sample_index < 0:
@@ -45,9 +53,11 @@ def run_mapper(rec):
             thr.append(f.threshold)
             prof.append(f.profile if f.profile is not None else np.full(len(mapper.ranges), np.nan))
             wall.append(f.facing_wall_m if f.facing_wall_m is not None else np.nan)
+            env.append(blank if f.envelopes is None else f.envelopes.astype(np.float32))
     return dict(t=np.array(t), state=np.array(state), pos=np.array(pos, float),
                 score=np.array(score), thr=np.array(thr), prof=np.array(prof),
-                wall=np.array(wall, float), ranges=mapper.ranges)
+                wall=np.array(wall, float), ranges=mapper.ranges, env=np.array(env),
+                channels=list(mapper.channels))
 
 
 def truth_at(rec, t):
@@ -75,18 +85,23 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("stem", help="the real recording, e.g. recordings/walk1")
     ap.add_argument("--sim", help="the simulated recording (default STEM_sim)")
+    ap.add_argument("--no-sim", action="store_true", help="show the recording only")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--no-loop", action="store_true",
+                    help="play the whole recording once instead of looping the walk")
     a = ap.parse_args()
     sim_stem = a.sim or f"{a.stem}_sim"
-    if not os.path.exists(sim_stem + ".flac"):
+    if not a.no_sim and not os.path.exists(sim_stem + ".flac"):
         raise SystemExit(f"{sim_stem}.flac not found — run: python recording_sim.py {a.stem}")
 
     import matplotlib.pyplot as plt
     from matplotlib.widgets import Slider
 
-    print("tracking both recordings …", flush=True)
-    real_rec, sim_rec = R.load(a.stem), R.load(sim_stem)
-    runs = {"recording": run_mapper(real_rec), "simulation": run_mapper(sim_rec)}
+    print("tracking …", flush=True)
+    real_rec = R.load(a.stem)
+    runs = {"recording": run_mapper(real_rec)}
+    if not a.no_sim:
+        runs["simulation"] = run_mapper(R.load(sim_stem))
     t_end = min(r["t"][-1] for r in runs.values())
     t0_chunk = real_rec.chunk_times[0]
     scan_t = np.array([t for t, _ in real_rec.scans]) - t0_chunk
@@ -105,19 +120,31 @@ def main():
     plt.rcParams["keymap.back"] = []
     plt.rcParams["keymap.forward"] = []
     fig = plt.figure(figsize=(16, 9.5))
-    fig.canvas.manager.set_window_title(f"{a.stem}: recording vs simulation")
+    fig.canvas.manager.set_window_title(f"{a.stem}: recording" + ("" if a.no_sim else " vs simulation"))
     gs = fig.add_gridspec(2, 3, height_ratios=[1.6, 1], left=0.04, right=0.98,
                           top=0.95, bottom=0.11, hspace=0.25, wspace=0.18)
-    maps = {"recording": fig.add_subplot(gs[0, 0]), "simulation": fig.add_subplot(gs[0, 1])}
+    maps = ({"recording": fig.add_subplot(gs[0, 0:2])} if a.no_sim else
+            {"recording": fig.add_subplot(gs[0, 0]), "simulation": fig.add_subplot(gs[0, 1])})
     ax_rt = fig.add_subplot(gs[0, 2])
-    ax_pr = fig.add_subplot(gs[1, :])
+    ax_ec = fig.add_subplot(gs[1, 0:2])
+    ax_pr = fig.add_subplot(gs[1, 2])
     colors = {"recording": REAL_C, "simulation": SIM_C}
 
     art = {}
+    # map limits: the bulk of the LiDAR scans, the walker and every estimate, + margin
+    allxy = np.vstack([np.vstack(scan_xy) if scan_xy else np.empty((0, 2)), truth_xy,
+                       *[r["pos"] for r in runs.values()], G.MIC_POSITIONS, [G.TX_POSITION]])
+    allxy = allxy[~np.isnan(allxy).any(axis=1)]
+    lo, hi = np.percentile(allxy, 1, axis=0), np.percentile(allxy, 99, axis=0)
+    for r in runs.values():                       # estimates must never be cut off
+        p = r["pos"][~np.isnan(r["pos"][:, 0])]
+        if len(p):
+            lo, hi = np.minimum(lo, p.min(0)), np.maximum(hi, p.max(0))
+    lo, hi = lo - 0.3, hi + 0.3
     for name, ax in maps.items():
         ax.set_aspect("equal")
-        ax.set_xlim(-2.1, 2.6)
-        ax.set_ylim(-0.4, 4.7)
+        ax.set_xlim(lo[1], hi[1])
+        ax.set_ylim(min(lo[0], -0.4), hi[0])
         ax.grid(alpha=0.5)
         ax.set_xlabel("right (m)")
         ax.set_ylabel("depth (m)")
@@ -145,7 +172,7 @@ def main():
     for name, r in runs.items():
         ax_rt.plot(r["t"], np.linalg.norm(r["pos"], axis=1), ".", c=colors[name], ms=3, label=name)
     ax_rt.set_xlim(0, t_end)
-    ax_rt.set_ylim(0, 4.5)
+    ax_rt.set_ylim(0, max(4.5, np.nanmax([np.nanmax(np.linalg.norm(r["pos"], axis=1)) for r in runs.values()]) + 0.3))
     ax_rt.set_xlabel("time (s)")
     ax_rt.set_ylabel("range (m)")
     ax_rt.grid(alpha=0.5)
@@ -159,6 +186,31 @@ def main():
                        f"median error {np.nanmedian(r['err'][tracked]):.2f} m")
     ax_rt.set_title("\n".join(summary), fontsize=9)
 
+    # echo per mic: noise-normalised change from the background, one lane per mic
+    chans = runs["recording"]["channels"]
+    mics = G.MIC_POSITIONS[chans]
+    half_path = np.arange(M.WINDOW) / M.capture.RATE * M.T.C / 2
+    CLIP = 8.0                                   # noise units at the top of a lane
+    echo_lines = {n: [ax_ec.plot(half_path, np.full(M.WINDOW, np.nan), c=colors[n], lw=0.9,
+                                 alpha=0.85 if n == "recording" else 0.7)[0] for _ in chans]
+                  for n in runs}
+    truth_ticks = ax_ec.plot([], [], "|", c=TRUTH_C, ms=22, mew=2.5)[0]
+    est_ticks = {n: ax_ec.plot([], [], "^", c=colors[n], ms=7)[0] for n in runs}
+    for j in range(len(chans)):
+        ax_ec.axhline(j, c="#444", lw=0.8)
+    ax_ec.set_yticks(np.arange(len(chans)) + 0.45, [f"mic {c}" for c in chans])
+    ax_ec.set_xlim(0.3, half_path[-1])
+    ax_ec.set_ylim(-0.1, len(chans))
+    ax_ec.set_xlabel("echo path / 2 ≈ range (m)")
+    ax_ec.set_title(f"echo per mic: change from the background, 0–{CLIP:g}× noise "
+                    "(green: LiDAR walker, ▲: tracker)", fontsize=10)
+    ax_ec.grid(alpha=0.5, axis="x")
+
+    def half_paths(p):
+        if np.isnan(p[0]):
+            return np.full(len(chans), np.nan)
+        return (np.linalg.norm(p - G.TX_POSITION) + np.linalg.norm(p - mics, axis=1)) / 2
+
     # range profile
     rng_axis = runs["recording"]["ranges"]
     prof_lines = {n: ax_pr.plot(rng_axis, np.zeros_like(rng_axis), c=colors[n], lw=1.5, label=n)[0]
@@ -169,7 +221,7 @@ def main():
     ax_pr.set_ylim(0, 10)
     ax_pr.set_xlabel("range (m)")
     ax_pr.set_ylabel("integrated score")
-    ax_pr.set_title("mapper range profile (dotted: detection threshold)", fontsize=10)
+    ax_pr.set_title("range profile (dotted: detection threshold)", fontsize=10)
     ax_pr.grid(alpha=0.5)
     ax_pr.legend(fontsize=8, facecolor="#000", edgecolor="none", loc="upper right")
 
@@ -177,7 +229,13 @@ def main():
     slider = Slider(ax_sl, "time (s)", 0, t_end, valinit=0, color="#555")
     slider.label.set_color("#ddd")
     slider.valtext.set_color("#ddd")
-    state = dict(t=0.0, playing=True, speed=a.speed, wall=time.monotonic(), setting=False)
+    walk = np.where(~np.isnan(truth_xy[:, 0]))[0]
+    loop_span = ((max(0.0, truth_t[walk[0]] - 1.0), min(t_end, truth_t[walk[-1]] + 1.0))
+                 if len(walk) else (0.0, t_end))
+    loop_band = ax_rt.axvspan(*loop_span, color="#fff", alpha=0.06)
+    state = dict(t=loop_span[0] if not a.no_loop else 0.0, playing=True, speed=a.speed,
+                 wall=time.monotonic(), setting=False, loop=not a.no_loop)
+    loop_band.set_visible(state["loop"])
     status = fig.text(0.90, 0.035, "", fontsize=10, family="monospace")
 
     def draw(t):
@@ -210,9 +268,19 @@ def main():
                                f"error {'   –' if np.isnan(err) else f'{err:4.2f}'} m")
             prof_lines[name].set_ydata(r["prof"][i])
             thr_lines[name].set_ydata([r["thr"][i]] * 2)
+            for j, line in enumerate(echo_lines[name]):
+                line.set_ydata(j + 0.9 * np.clip(r["env"][i][:, j], 0, CLIP) / CLIP)
+            hp = half_paths(r["pos"][i])
+            est_ticks[name].set_data(hp, np.arange(len(chans)) + 0.93)
         truth_line.set_xdata([np.linalg.norm(tt[-1])] * 2 if len(tt) else [np.nan] * 2)
+        if len(tt) and not np.isnan(tt[-1][0]):
+            # the mapper's timing (LOCK_OFFSET) is calibrated to the LiDAR-seen surface
+            truth_ticks.set_data(half_paths(tt[-1]), np.arange(len(chans)) + 0.45)
+        else:
+            truth_ticks.set_data([], [])
         cursor.set_xdata([t, t])
-        status.set_text(f"{'▶' if state['playing'] else '❚❚'} ×{state['speed']:g}")
+        status.set_text(f"{'▶' if state['playing'] else '❚❚'} ×{state['speed']:g}"
+                        f"{'  loop' if state['loop'] else ''}")
         state["setting"] = True
         slider.set_val(t)
         state["setting"] = False
@@ -221,7 +289,9 @@ def main():
         now = time.monotonic()
         if state["playing"]:
             state["t"] += (now - state["wall"]) * state["speed"]
-            if state["t"] >= t_end:
+            if state["loop"] and not loop_span[0] <= state["t"] < loop_span[1]:
+                state["t"] = loop_span[0]
+            elif state["t"] >= t_end:
                 state["t"], state["playing"] = t_end, False
         state["wall"] = now
         draw(state["t"])
@@ -243,6 +313,9 @@ def main():
             state["speed"] = min(8.0, state["speed"] * 2)
         elif e.key in ("-", "_"):
             state["speed"] = max(0.125, state["speed"] / 2)
+        elif e.key == "l":
+            state["loop"] = not state["loop"]
+            loop_band.set_visible(state["loop"])
 
     slider.on_changed(on_slider)
     fig.canvas.mpl_connect("key_press_event", on_key)

@@ -44,6 +44,7 @@ class TrackingFrame:
     threshold: float | None = None
     position: tuple[float, float] | None = None
     support: int = 0
+    facing_wall_m: float | None = None   # depth of the wall facing the device, if known
 
 
 class AudiodeviceTracker:

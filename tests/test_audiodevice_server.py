@@ -95,6 +95,9 @@ class AudiodeviceServerTests(unittest.TestCase):
         self.assertEqual(max(payload["traces"][5]), 1.0)
         self.assertEqual(np.array(payload["scores"]).shape, (45, 61))
         json.dumps(payload)
+        self.assertIsNone(payload["facing_wall_m"])
+        walled = server.frame_payload(tracking.TrackingFrame("no_target", 5.0, 4, facing_wall_m=4.3214))
+        self.assertEqual(walled["facing_wall_m"], 4.321)
 
     def test_lidar_controls_and_replay_do_not_start_audio(self):
         self.session.lidar_port = "/dev/ttyUSB0"

@@ -427,3 +427,47 @@ class AudiodeviceMapper:
         self.static_ranges.clear()
         self.history.clear()
         return True
+
+
+class LiveMapper:
+    """AudiodeviceMapper behind the live GUIs' interface.
+
+    ``push`` returns ``audiodevice_tracking.TrackingFrame`` objects, so
+    audiodevice_live.py and audiodevice_server.py show the mapper's tracking:
+    ``envelopes`` are the front mics' echoes (change from the background in
+    noise units; rear-mic columns are zero) indexed by echo path from the
+    speaker, ``scores`` the mapper's change-evidence grid over
+    ``depths`` × ``laterals``."""
+
+    def __init__(self, low_hz=18_000, high_hz=22_000, **mapper_args):
+        self.mapper = AudiodeviceMapper(low_hz, high_hz, **mapper_args)
+        self.depths = self.mapper.heat_depths
+        self.laterals = self.mapper.heat_laterals
+        self.channels = list(self.mapper.channels)
+        self._last = (None, None)          # envelopes, heat of the last processed ping
+
+    def reset_calibration(self):
+        self.mapper.reset_calibration()
+        self._last = (None, None)
+
+    def push(self, samples):
+        return [self._frame(f) for f in self.mapper.push(samples)]
+
+    def _frame(self, f):
+        TF = geometry.TrackingFrame
+        if f.state == "locking":
+            return TF("syncing", f.lock_quality, 0)
+        calibration = int(round(f.cal_progress * geometry.CALIBRATION_UPDATES))
+        if f.state == "calibrating":
+            return TF("calibrating", f.lock_quality, calibration, facing_wall_m=f.facing_wall_m)
+        if f.envelopes is not None:
+            env = np.zeros((len(f.envelopes), 6))
+            env[:, self.channels] = f.envelopes
+            self._last = (env, f.heat)
+        else:                               # ping skipped (sync check): keep the display
+            env = self._last[0]
+        heat = f.heat if f.heat is not None else self._last[1]
+        tracking = f.state == "tracking"
+        return TF("tracking" if tracking else "no_target", f.lock_quality, calibration, env,
+                  heat, f.threshold, f.position if tracking else None,
+                  len(self.channels) if tracking else 0, f.facing_wall_m)

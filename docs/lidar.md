@@ -38,8 +38,12 @@ only the browser overlay. Ultrasound estimates remain experimental: no
 automatic alignment, time synchronization, sensor fusion, or accuracy claim.
 Different sensor heights may see different objects.
 
-Layer toggles and 3/6/12-metre view radii help compare returns with the ultrasound
-evidence grid. The wider view does not extend the ultrasound detection region.
+Layer toggles and the view setting help compare returns with the ultrasound
+evidence grid. **Auto** (the default) fits the view to the device, the evidence
+grid, the trail and the bulk of the current LiDAR scan. It grows at once when
+something would leave the frame and shrinks back slowly. The fixed 3, 6 and
+12 m radii are still available. A wider view does not extend the ultrasound
+detection region.
 
 ## Recordings
 
@@ -61,8 +65,8 @@ LiDAR** for the recorded scans) as in a live session:
 .venv/bin/python audiodevice_live.py --recording recordings/walk1_sim    # Matplotlib window
 ```
 
-`--speed 2` replays twice as fast. Both GUIs run their own live tracker
-(`audiodevice_tracking`), not the `AudiodeviceMapper` that `replay` scores.
+`--speed 2` replays twice as fast. Both GUIs run the same `AudiodeviceMapper`
+that `replay` scores.
 
 Audio is stored losslessly as 24-bit six-channel FLAC (`STEM.flac`); chunk host
 times, LiDAR scans, an optional walker track and metadata go in `STEM.npz`
