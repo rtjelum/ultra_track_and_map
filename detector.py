@@ -10,7 +10,7 @@ pair to estimate angle of arrival.
 Requires:
     pip install sounddevice numpy scipy
 Hardware:
-    - 6-channel USB audio interface supporting >= 96 kHz sample rate
+    - 6-channel USB audio interface supporting 48 kHz sample rate
     - 6x 20 kHz receivers wired to interface inputs
     - transmitter.py running on GPIO18
 """

@@ -17,7 +17,8 @@ wall or free‑standing at any angle.
 The code is currently a **simulator with a live visualizer**: it simulates the
 room acoustics and runs the signal-processing pipeline (`tracker.py`,
 `wallmap.py`; the same code you would run on hardware) on the simulated
-microphone signals.
+microphone signals. The same pipeline also runs live on an Audiodevice target
+(see [Audiodevice live demo](#audiodevice-live-demo)).
 
 ![Simulation: tracking a moving object and mapping the room](docs/simulation.gif)
 
@@ -241,3 +242,137 @@ stays detected; a weak, distant one stays tracked through its gate.
 `detector.py` and `transmitter.py` are earlier hardware scripts (Raspberry Pi
 `pigpio` square-wave transmitter, `sounddevice` capture with a CW/bandpass
 approach); they do not yet implement the chirp pipeline above.
+
+## Audiodevice capture experiment
+
+`audiodevice_capture.py` records the target's six raw microphones while playing a
+two-second chirp train. It is a hardware probe, **not yet a live tracker**:
+chirp timing, physical microphone/speaker geometry, off-axis detection and
+the simulator's tracking pipeline still need hardware calibration.
+
+The Audiodevice geometry supplied for the test below differs from the simulator.
+Coordinates are in centimetres relative to the speaker, with positive
+along-bar coordinates to the right as viewed from the front and negative
+depth behind the speaker. Channel numbers are zero-based:
+
+| Channel | Along bar | Depth |
+|---|---:|---:|
+| 0 | 27 | 0 |
+| 1 | 27 | -3.5 |
+| 2 | 11 | 0 |
+| 3 | 11 | -3.5 |
+| 4 | 43 | 0 |
+| 5 | 43 | -3.5 |
+
+The device center is 19 cm to the right of the speaker. These supplied
+coordinates have not yet been validated by a position-tracking test.
+
+From this directory, with this checkout inside `platform_dsp_qcs`:
+
+```sh
+adb devices -l
+adb -s SERIAL root
+.venv/bin/python audiodevice_capture.py --serial SERIAL --band 18000 22000 /tmp/audiodevice.wav
+.venv/bin/python audiodevice_capture.py --serial SERIAL --band 18000 22000 --level 20 /tmp/audiodevice-20.wav
+adb -s SERIAL unroot
+```
+
+The device must have its speaker route active and its microphone capture route
+idle; do not run it during a call or other audio use. The tool temporarily
+configures the microphones using a compatible six-channel PCM profile from the
+parent platform project, then restores the previous mixer values. A forced termination or device
+disconnect can prevent restoration.
+
+The chirp starts no lower than 10 kHz and uses 5 ms pulses at 10 Hz. Playback
+defaults to 1% peak amplitude; `--level 20` requests 20% peak amplitude, and
+the tool refuses values above 20%. Digital level is **not** a sound-pressure
+measurement. High frequencies may be inaudible, so lack of discomfort does not
+establish safety. Keep people and animals clear unless the acoustic output has
+been measured safe. The optional `--band 12000 16000` showed stronger
+responses on this device, but is within the audible range. The WAV contains raw
+microphone audio, including any speech in the room. The recording does not
+provide a synchronized transmit sample or calibrated positions.
+
+## Audiodevice live demo
+
+The Python GUI streams all six microphones over ADB, synchronizes to the chirps,
+and shows background-subtracted changes and experimental candidate positions.
+It is a separate, simplified tracker, not the simulator's full tracking or
+room-mapping pipeline. Positions, timing and the supplied geometry are
+uncalibrated; off-axis detection and real-world accuracy remain unvalidated.
+
+Use the same device, routing and safety prerequisites as the capture
+experiment above. From this directory, after running `./setupenv.sh`:
+
+```sh
+adb devices -l
+adb -s SERIAL root
+.venv/bin/python audiodevice_live.py --serial SERIAL --band 18000 22000 --level 20
+```
+
+Replace `SERIAL` with the device's ADB serial, or omit `--serial` to detect a
+single connected ADB device. The example uses 20% digital peak because a 1%
+device test did not synchronize, while one 20% test synchronized and completed
+calibration. **Neither result establishes a safe acoustic level.** The GUI
+defaults to 1%; `--level` accepts values above zero through 20%. By default a
+session plays chirps continuously until **Stop** is pressed or the window is
+closed (a single playback stream ends by itself after about 3.1 hours, the
+32-bit WAV size limit). `--seconds N` optionally ends the session after N
+seconds (minimum 5). Chirps begin at 10 kHz or above and end below 24 kHz; the
+default is 18–22 kHz.
+
+Opening the window does not play audio. Press **Start** to begin the
+session. Leave the target out and the background still during synchronization
+and calibration; then look for changes on the map. **Recalibrate** records a
+new stationary background; **Stop** ends playback and restores the mixer.
+Traces are normalized per microphone and the heat map is change evidence,
+not a room map. Candidates appear on the first update that passes the signal
+threshold and has support from at least three microphones, without waiting for
+a second consistent estimate. Each update averages the latest five pings
+(0.5 seconds) but a new update is produced after every ping, so the display
+refreshes 10 times per second; consecutive updates share four of their five
+pings, so motion still appears smoothed over about half a second. Initial or
+inconsistent estimates appear in orange as unconfirmed candidates; the marker
+turns cyan when the estimate agrees with the one from 0.5 seconds earlier,
+which shares no pings with it. Synchronization and calibration likewise use
+non-overlapping pings and take as long as before. Showing unconfirmed
+candidates can expose transient false positives and position jumps; a candidate
+is not guaranteed to be a real target.
+
+Playback and microphone audio pass through FIFOs in `/data/local/tmp`, so raw
+microphone audio is not accumulated on the device during long sessions. The
+FIFOs and small chirp files are removed on normal stop or exit, but a forced
+termination or disconnect can leave them or the mixer settings behind. If the
+device starts using its microphones (for example, a call or USB audio from the
+host), the device's audio stack takes over the microphone route and the session
+ends with an error; the GUI refuses to start while that route is in use. The tool leaves ADB rooted for repeated tests. If desired, run
+`adb -s SERIAL unroot` after closing the window.
+
+### Browser streaming server
+
+`audiodevice_server.py` runs the same device session and tracker as a local
+streaming server and draws the results in a web browser. Redrawing in the
+browser takes a few milliseconds per update, against about 0.2 seconds for the
+Matplotlib window, so use the server when the GUI feels slow:
+
+```sh
+.venv/bin/python audiodevice_server.py --serial SERIAL --band 18000 22000 --level 20
+```
+
+Open the printed address (default `http://localhost:8765/`; with VS Code
+Remote, forward the port) and press **Start**, **Recalibrate** or **Stop**. It
+accepts the same `--band`, `--level` and `--seconds` options as the GUI, plus
+`--port`. Unlike the GUI, the server defaults to `--level 20`. Opening the page does not play audio. Only one device session runs at
+a time; every open page shows the same live stream. Updates are sent with
+Server-Sent Events at the tracker's rate of 10 per second, and a slow page
+skips stale updates rather than delaying the stream.
+
+The server listens on `127.0.0.1` only. Control requests must carry a custom
+header and a local `Host`, so other web pages cannot start playback. `--host`
+can expose the server on a network, but then anyone who can reach it can start
+the device's audio. Press Ctrl+C (or send SIGTERM) to stop the server; it ends
+any session and restores the device first.
+
+Both the GUI and the server batch the mixer reads and writes for the
+microphone route into single ADB calls, so opening and restoring the route
+takes about 2 seconds rather than about 10.

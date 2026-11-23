@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audiodevice live chirp tracker — EXPERIMENTAL</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin: 0; background: #101722; color: #dce4ec; font: 14px system-ui, sans-serif; }
+  header { padding: 12px 20px 4px; }
+  h1 { margin: 0; font-size: 20px; color: white; }
+  .warn { color: #ffcc80; font-size: 13px; margin: 4px 0; }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.15fr);
+         gap: 16px; padding: 8px 20px; }
+  .panel { background: #1a2533; border: 1px solid #718096; border-radius: 6px; padding: 8px; }
+  .panel h2 { margin: 0 0 6px; font-size: 14px; color: white; font-weight: 600; }
+  canvas { width: 100%; display: block; }
+  #status { color: #87e0cb; font-size: 15px; min-height: 20px; }
+  #status.error { color: #ff8a80; }
+  #info { white-space: pre-line; line-height: 1.5; font-size: 13px; }
+  .legend span { display: inline-block; margin-right: 10px; font-size: 12px; }
+  .legend i { display: inline-block; width: 12px; height: 3px; vertical-align: middle;
+              margin-right: 4px; }
+  footer { display: flex; gap: 10px; align-items: center; padding: 6px 20px 16px; }
+  button { font-size: 14px; padding: 7px 18px; border-radius: 4px; border: 1px solid #718096;
+           background: #2d3b4e; color: white; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #start { background: #23624f; }
+  #stop { background: #7a2e2e; }
+  #conn { margin-left: auto; font-size: 12px; color: #a0aec0; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 8px 0; }
+  input[type=number], select { background: #101722; color: white; border: 1px solid #718096;
+                              border-radius: 4px; padding: 4px; width: 72px; }
+  #lidar-status.error { color: #ff8a80; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; padding: 8px; }
+    footer { flex-wrap: wrap; padding: 12px; }
+    #conn { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Audiodevice live chirp tracker — EXPERIMENTAL</h1>
+  <div class="warn" id="settings"></div>
+  <div class="warn">Sound pressure is unknown; high frequencies may be inaudible.
+    Keep people and animals clear unless the acoustic output has been measured safe.</div>
+</header>
+<main>
+  <div class="panel">
+    <h2>Ultrasound evidence + LD-19 scan</h2>
+    <div class="controls">
+      <label><input id="show-heat" type="checkbox" checked> Ultrasound evidence</label>
+      <label><input id="show-lidar" type="checkbox" checked> LiDAR returns</label>
+      <label><input id="show-trail" type="checkbox" checked> Candidate trail</label>
+      <label>View radius (m) <select id="view-range"><option>3</option><option>6</option><option>12</option></select></label>
+    </div>
+    <canvas id="map" width="640" height="600"></canvas>
+    <div class="legend">
+      <span><i style="background:#4cd1bf;height:8px;width:8px;border-radius:4px"></i>Microphones</span>
+      <span style="color:#ffd36b">★ Speaker</span>
+      <span><i style="background:#ffae42;height:10px;width:10px;border-radius:5px"></i>Unconfirmed candidate</span>
+      <span><i style="background:#40dcff;height:10px;width:10px;border-radius:5px"></i>Consistent candidate</span>
+      <span><i style="background:#b4f585;height:6px;width:6px"></i>LiDAR return</span>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2 id="trace-title">Matched-filter response</h2>
+      <canvas id="traces" width="720" height="300"></canvas>
+      <div class="legend" id="trace-legend"></div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <div id="info"></div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>LD-19 serial sensor</h2>
+      <div id="lidar-status" role="status">Not configured</div>
+      <div class="controls">
+        <button id="lidar-start" disabled>Start LiDAR</button>
+        <button id="lidar-stop" disabled>Stop LiDAR</button>
+      </div>
+      <div class="controls">
+        <label>Forward (m) <input id="lidar-depth" type="number" value="0" step="0.01"></label>
+        <label>Right (m) <input id="lidar-lateral" type="number" value="0" step="0.01"></label>
+        <label>Yaw (°) <input id="lidar-yaw" type="number" value="0" step="1"></label>
+      </div>
+      <div class="warn">Set the sensor mounting pose: yaw 0 aligns the LiDAR zero-angle ray
+        forward; positive yaw turns right. Overlay alignment is manual, not calibrated
+        sensor fusion. LiDAR may scan a different height from the ultrasound.</div>
+      <div id="lidar-pose-status" class="warn" role="status"></div>
+    </div>
+  </div>
+</main>
+<footer>
+  <div id="status" role="status">Connecting…</div>
+  <span id="conn"></span>
+  <button id="start">Start</button>
+  <button id="recal">Recalibrate</button>
+  <button id="stop">Stop</button>
+</footer>
+<script>
+"use strict";
+const COLORS = ["#ffae42", "#fa6d6d", "#8bd17c", "#44c2ad", "#89aaff", "#d599f0"];
+// Approximate matplotlib "magma" stops.
+const MAGMA = [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],[245,125,21],[250,193,39],[252,253,191]];
+const $ = id => document.getElementById(id);
+let cfg = null, frame = null, history = [], status = {running: false, stopping: false};
+let scan = null, scanReceived = 0, connected = false;
+let lidarStatus = {running: false, stopping: false, error: false, text: "Not configured"};
+
+function lidarPoint([angle, distance]) {
+  const yaw = $("lidar-yaw").valueAsNumber, depth = $("lidar-depth").valueAsNumber;
+  const lateral = $("lidar-lateral").valueAsNumber;
+  if (![yaw, depth, lateral].every(Number.isFinite)) return null;
+  const radians = (angle + yaw) * Math.PI / 180;
+  return [depth + distance * Math.cos(radians), lateral + distance * Math.sin(radians)];
+}
+
+function magma(t) {
+  t = Math.min(1, Math.max(0, t)) * (MAGMA.length - 1);
+  const i = Math.min(MAGMA.length - 2, Math.floor(t)), f = t - i, a = MAGMA[i], b = MAGMA[i + 1];
+  return [0, 1, 2].map(k => Math.round(a[k] + (b[k] - a[k]) * f));
+}
+
+function mapGeometry(canvas) {
+  const radius = Number($("view-range").value);
+  const lat0 = cfg.lidar_port ? -radius : cfg.laterals[0];
+  const lat1 = cfg.lidar_port ? radius : cfg.laterals[cfg.laterals.length - 1];
+  const dep0 = cfg.lidar_port ? -radius : -0.15;
+  const dep1 = cfg.lidar_port ? radius : cfg.depths[cfg.depths.length - 1];
+  const pad = {l: 52, r: 10, t: 10, b: 44};
+  const w = canvas.width - pad.l - pad.r, h = canvas.height - pad.t - pad.b;
+  const scale = Math.min(w / (lat1 - lat0), h / (dep1 - dep0));
+  const ox = pad.l + (w - scale * (lat1 - lat0)) / 2, oy = pad.t + (h - scale * (dep1 - dep0)) / 2;
+  return {
+    x: lat => ox + (lat - lat0) * scale,
+    y: dep => oy + (dep1 - dep) * scale,
+    lat0, lat1, dep0, dep1, scale,
+  };
+}
+
+function drawMap() {
+  const c = $("map"), g = c.getContext("2d");
+  g.fillStyle = "#1a2533"; g.fillRect(0, 0, c.width, c.height);
+  if (!cfg) return;
+  const m = mapGeometry(c);
+  const step = 0.05;
+  if ($("show-heat").checked && frame && frame.scores) {
+    const vmax = Math.max(2, (frame.threshold || 0) * 1.5);
+    g.globalAlpha = 0.8;
+    frame.scores.forEach((row, i) => row.forEach((v, j) => {
+      const [r, gg, b] = magma(v / vmax);
+      g.fillStyle = `rgb(${r},${gg},${b})`;
+      const x = m.x(cfg.laterals[j] - step / 2), y = m.y(cfg.depths[i] + step / 2);
+      g.fillRect(x, y, step * m.scale + 0.5, step * m.scale + 0.5);
+    }));
+    g.globalAlpha = 1;
+  }
+  // Axes.
+  g.strokeStyle = "#718096"; g.lineWidth = 1;
+  g.strokeRect(m.x(m.lat0), m.y(m.dep1), (m.lat1 - m.lat0) * m.scale, (m.dep1 - m.dep0) * m.scale);
+  const tick = cfg.lidar_port ? Math.max(1, Number($("view-range").value) / 3) : 0.5;
+  g.fillStyle = "#dce4ec"; g.font = "14px system-ui"; g.textAlign = "center";
+  for (let v = Math.ceil(m.lat0 / tick) * tick; v <= m.lat1 + 1e-6; v += tick)
+    g.fillText(v.toFixed(1), m.x(v), m.y(m.dep0) + 17);
+  g.textAlign = "right";
+  for (let v = Math.ceil(m.dep0 / tick) * tick; v <= m.dep1 + 1e-6; v += tick)
+    g.fillText(v.toFixed(1), m.x(m.lat0) - 4, m.y(v) + 4);
+  g.textAlign = "center"; g.fillStyle = "white";
+  g.fillText("Left / right of device centre (m)", m.x(0), c.height - 6);
+  g.save(); g.translate(14, m.y((m.dep0 + m.dep1) / 2)); g.rotate(-Math.PI / 2);
+  g.fillText("Forward / behind device (m)", 0, 0); g.restore();
+  if ($("show-lidar").checked && scan && connected && performance.now() - scanReceived < 1500) {
+    g.save();
+    g.beginPath();
+    g.rect(m.x(m.lat0), m.y(m.dep1), (m.lat1 - m.lat0) * m.scale, (m.dep1 - m.dep0) * m.scale);
+    g.clip();
+    g.fillStyle = "#b4f585";
+    scan.points.forEach(point => {
+      const p = lidarPoint(point);
+      if (p && point[2] > 0) g.fillRect(m.x(p[1]) - 1.5, m.y(p[0]) - 1.5, 3, 3);
+    });
+    const origin = lidarPoint([0, 0]);
+    if (origin) {
+      g.strokeStyle = "#b4f585"; g.lineWidth = 2;
+      g.strokeRect(m.x(origin[1]) - 5, m.y(origin[0]) - 5, 10, 10);
+    }
+    g.restore();
+  }
+  // Device bar, microphones and speaker.
+  g.strokeStyle = "#e2e8f0"; g.lineWidth = 4;
+  g.beginPath(); g.moveTo(m.x(-0.19), m.y(0)); g.lineTo(m.x(0.24), m.y(0)); g.stroke();
+  g.fillStyle = "#4cd1bf";
+  cfg.mics.forEach(([d, l]) => { g.beginPath(); g.arc(m.x(l), m.y(d), 3.5, 0, 2 * Math.PI); g.fill(); });
+  g.fillStyle = "#ffd36b"; g.font = "18px system-ui";
+  g.fillText("★", m.x(cfg.speaker[1]), m.y(cfg.speaker[0]) + 6);
+  // Trail and current candidate.
+  if ($("show-trail").checked && history.length > 1) {
+    g.strokeStyle = "rgba(76,209,255,0.65)"; g.lineWidth = 1.5; g.beginPath();
+    history.forEach(([d, l], i) => i ? g.lineTo(m.x(l), m.y(d)) : g.moveTo(m.x(l), m.y(d)));
+    g.stroke();
+  }
+  if (frame && frame.position) {
+    const [d, l] = frame.position;
+    g.fillStyle = frame.state === "candidate" ? "#ffae42" : "#40dcff";
+    g.strokeStyle = "white"; g.lineWidth = 1.5;
+    g.beginPath(); g.arc(m.x(l), m.y(d), 7, 0, 2 * Math.PI); g.fill(); g.stroke();
+  }
+}
+
+function drawTraces() {
+  const c = $("traces"), g = c.getContext("2d");
+  g.fillStyle = "#1a2533"; g.fillRect(0, 0, c.width, c.height);
+  if (!cfg) return;
+  const pad = {l: 46, r: 10, t: 8, b: 40};
+  const w = c.width - pad.l - pad.r, h = c.height - pad.t - pad.b;
+  const n = frame && frame.traces ? frame.traces[0].length : 420;
+  const xmax = (n - 1) * cfg.trace_spacing_m;
+  const X = x => pad.l + x / xmax * w, Y = y => pad.t + h - y / 1.05 * h;
+  g.strokeStyle = "rgba(220,228,236,0.2)"; g.lineWidth = 1; g.fillStyle = "#dce4ec";
+  g.font = "14px system-ui"; g.textAlign = "center";
+  for (let x = 0; x <= xmax + 1e-6; x += 1) {
+    g.beginPath(); g.moveTo(X(x), pad.t); g.lineTo(X(x), pad.t + h); g.stroke();
+    g.fillText(x.toFixed(0), X(x), pad.t + h + 17);
+  }
+  g.textAlign = "right";
+  for (let y = 0; y <= 1.0001; y += 0.25) {
+    g.beginPath(); g.moveTo(pad.l, Y(y)); g.lineTo(pad.l + w, Y(y)); g.stroke();
+    g.fillText(y.toFixed(2), pad.l - 4, Y(y) + 4);
+  }
+  g.textAlign = "center"; g.fillStyle = "white";
+  g.fillText("Excess path from reference mic (m) — per-mic normalized envelope", pad.l + w / 2, c.height - 6);
+  if (!frame || !frame.traces) return;
+  frame.traces.forEach((trace, ch) => {
+    g.strokeStyle = COLORS[ch]; g.lineWidth = 1; g.beginPath();
+    trace.forEach((v, i) => i ? g.lineTo(X(i * cfg.trace_spacing_m), Y(v)) : g.moveTo(X(0), Y(v)));
+    g.stroke();
+  });
+}
+
+const STATE_TEXT = {
+  syncing: "Waiting for a stable chirp reference — no position.",
+  no_target: "No sufficiently supported change — no position.",
+  candidate: "Unconfirmed candidate — position accuracy is unverified.",
+  tracking: "Experimental candidate — position accuracy is unverified.",
+};
+
+function render() {
+  const lines = [
+    `Device: ${cfg ? cfg.serial : "?"}`,
+    "Remove the moving target during calibration. Position estimates use supplied " +
+    "geometry and an assumed direct-path timing reference; they are not calibrated " +
+    "or ground truth. Hotter colors indicate stronger change, not a room map.",
+  ];
+  if (frame) {
+    lines.push("", `Sync peak / median: ${frame.sync_ratio.toFixed(1)}`,
+               `Channels supporting peak: ${frame.support} / 6`);
+    if (frame.position) {
+      const [d, l] = frame.position;
+      lines.push(`Candidate: ${d.toFixed(2)} m forward, ${l >= 0 ? "+" : ""}${l.toFixed(2)} m right`);
+    }
+  }
+  $("info").textContent = lines.join("\n");
+  $("trace-title").textContent = frame && frame.state !== "calibrating"
+    ? "Change from calibrated background" : "Matched-filter response";
+  drawMap(); drawTraces();
+  $("start").disabled = !connected || status.running;
+  $("recal").disabled = !connected || !status.running || status.stopping;
+  $("stop").disabled = !connected || !status.running || status.stopping;
+  $("lidar-start").disabled = !connected || !cfg?.lidar_port || lidarStatus.running;
+  $("lidar-stop").disabled = !connected || !lidarStatus.running || lidarStatus.stopping;
+  const fresh = scan && connected && performance.now() - scanReceived < 1500;
+  $("lidar-status").textContent = fresh
+    ? `${cfg.lidar_port} | ${scan.hz.toFixed(1)} Hz | ${scan.points.length} returns | ${scan.bad_packets} rejected packets`
+    : lidarStatus.running && !lidarStatus.stopping ? "Waiting for fresh LiDAR scans..." : lidarStatus.text;
+  $("lidar-status").className = lidarStatus.error ? "error" : "";
+  $("lidar-pose-status").textContent = lidarPoint([0, 0]) ? ""
+    : "Enter finite numbers for all mounting offsets and yaw; LiDAR overlay is hidden.";
+}
+
+let pending = false;
+function scheduleRender() {
+  if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); }
+}
+
+function setStatus(text, error) {
+  const el = $("status"); el.textContent = text; el.className = error ? "error" : "";
+}
+
+function onFrame(f) {
+  frame = f;
+  if (f.position) {
+    history.push(f.position);
+    if (history.length > 30) history.shift();
+  } else {
+    history = [];
+  }
+  if (!status.stopping) {
+    setStatus(f.state === "calibrating"
+      ? `Calibrating ${f.calibration}/${cfg.calibration_updates}: keep the target out and the room still.`
+      : STATE_TEXT[f.state] || f.state, false);
+  }
+  scheduleRender();
+}
+
+async function post(action) {
+  try {
+    const r = await fetch(`/api/${action}`, {method: "POST", headers: {"X-Audiodevice-Control": "1"}});
+    const result = await r.json();
+    if (!r.ok || !result.accepted)
+      setStatus(`Request failed: ${result.error || (r.ok ? "Action not accepted" : r.status)}`, true);
+  } catch (e) { setStatus(`Request failed: ${e}`, true); }
+}
+$("start").onclick = () => post("start");
+$("recal").onclick = () => post("recalibrate");
+$("stop").onclick = () => post("stop");
+$("lidar-start").onclick = () => post("lidar/start");
+$("lidar-stop").onclick = () => post("lidar/stop");
+["show-heat", "show-lidar", "show-trail", "view-range", "lidar-depth", "lidar-lateral", "lidar-yaw"]
+  .forEach(id => $(id).addEventListener("input", scheduleRender));
+
+async function init() {
+  const response = await fetch("/api/config");
+  if (!response.ok) throw new Error(`Configuration request failed: ${response.status}`);
+  cfg = await response.json();
+  $("settings").textContent = `${cfg.band[0] / 1000}–${cfg.band[1] / 1000} kHz | ${cfg.level}% digital peak | ` +
+    (cfg.duration == null ? "runs until Stop." : `${cfg.duration} s session.`);
+  $("trace-legend").innerHTML = COLORS.map((c, i) => `<span><i style="background:${c}"></i>Mic ${i}</span>`).join("");
+  const events = new EventSource("/events");
+  events.onopen = () => { connected = true; $("conn").textContent = "Connected to server"; scheduleRender(); };
+  events.onerror = () => {
+    connected = false; frame = null; history = []; scan = null;
+    $("conn").textContent = "Disconnected — retrying…"; scheduleRender();
+  };
+  events.addEventListener("status", e => {
+    status = JSON.parse(e.data); setStatus(status.text, status.error); scheduleRender();
+  });
+  events.addEventListener("frame", e => onFrame(JSON.parse(e.data)));
+  events.addEventListener("reset", () => { frame = null; history = []; scheduleRender(); });
+  events.addEventListener("lidar", e => {
+    scan = JSON.parse(e.data); scanReceived = performance.now(); scheduleRender();
+  });
+  events.addEventListener("lidar_status", e => {
+    lidarStatus = JSON.parse(e.data);
+    if (!lidarStatus.running || lidarStatus.stopping) scan = null;
+    scheduleRender();
+  });
+  setInterval(scheduleRender, 500);
+  render();
+}
+init().catch(e => setStatus(`Cannot load configuration: ${e}`, true));
+</script>
+</body>
+</html>

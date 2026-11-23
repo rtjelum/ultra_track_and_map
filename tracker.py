@@ -39,6 +39,7 @@ import warnings
 from dataclasses import dataclass
 
 import numpy as np
+import scipy.ndimage
 import scipy.optimize
 from scipy.signal import chirp as sp_chirp
 
@@ -204,10 +205,16 @@ class Tracker:
     R_MAX_INFLATION = 100.0
     WALL_CLEARANCE  = 0.10  # an object (person) can't be closer to a wall
     SYNC_MIN_MATCH  = 0.9   # early window vs background correlation to trust a sync
+    # noise="per_bin": thresholds vs the learned per-delay residual level
+    DETECT_SNR_BIN  = 4.0
+    MEAS_SNR_BIN    = 2.5
+    NOISE_ALPHA     = 0.02  # update rate of the per-delay noise level
+    NOISE_SPREAD    = 15    # samples: max-filter of the noise level (echo jitter)
+    NOISE_CLIP      = 2.0   # per_bin: residual is clipped to this × noise when learning
 
     def __init__(self, mic_pos, tx_pos, chirp, n_samples, *, c=C, frame_dt=0.1,
                  mount_wall=None, multipath=False, async_map=False,
-                 sync=True, max_latency_s=0.05):
+                 sync=True, max_latency_s=0.05, front=None, noise="median"):
         """
         mic_pos (n, 2), tx_pos (2,): metres, any frame.
         n_samples:  samples per ping after alignment (sets the maximum range).
@@ -222,6 +229,18 @@ class Tracker:
                     the room), or None if free-standing. It tells front from
                     back and its echo 'twins' are modelled in wall mapping.
         multipath:  EXPERIMENTAL — model object↔wall bounces using the wall map.
+        front:      wallmap.Wall half-plane the object must be in front of, for
+                    a free-standing line array (tells front from back like
+                    mount_wall, but isn't a reflector: not used in sync or
+                    wall mapping).
+        noise:      "median" — each mic's noise level is the median residual
+                    of the ping (fine in simulation); "per_bin" — a noise level
+                    per delay, learned from the residual's spread over time
+                    (CFAR). Real rooms have static echoes that fluctuate
+                    (air movement and temperature drift their carrier phase,
+                    curtains move) and leave residuals stronger than a person;
+                    per_bin learns where that happens. Detection then uses
+                    DETECT_SNR_BIN / MEAS_SNR_BIN.
         """
         self.mic_pos = np.asarray(mic_pos, float)
         self.tx_pos = np.asarray(tx_pos, float)
@@ -232,6 +251,10 @@ class Tracker:
         if mount_wall is not None:
             mount_wall.known = True
         self.known_walls = [mount_wall] if mount_wall is not None else []
+        self.front = [front] if front is not None else []
+        if noise not in ("median", "per_bin"):
+            raise ValueError(f"noise must be 'median' or 'per_bin', not {noise!r}")
+        self.noise_model, self.noise = noise, None
         self.multipath = multipath
         self.pulse = wallmap.PulseModel(chirp.burst, chirp.ref) if multipath else None
 
@@ -263,7 +286,7 @@ class Tracker:
         pts = np.vstack([self.mic_pos, self.tx_pos])
         s = np.linalg.svd(pts - pts.mean(0), compute_uv=False)
         self.collinear = bool(s[-1] < 0.02 * s[0])
-        if self.collinear and not self.known_walls:
+        if self.collinear and not (self.known_walls or self.front):
             warnings.warn("mics and speaker are (nearly) on one line and no mounting "
                           "wall is given: front and back are indistinguishable "
                           "until the wall map closes")
@@ -293,7 +316,7 @@ class Tracker:
         hide the object from acquisition) — except in multipath mode, which
         relies on the map anyway and needs it to rule out the wall-bounce
         ghosts outside the room."""
-        return self.known_walls + (self.mapped_walls if self.multipath else [])
+        return self.known_walls + self.front + (self.mapped_walls if self.multipath else [])
 
     @property
     def mapped_walls(self):
@@ -461,7 +484,7 @@ class Tracker:
                 max_nfev=100, ftol=1e-10, xtol=1e-10)
 
         res = ls(x0)
-        for w in self.known_walls:
+        for w in self.known_walls + self.front:
             if w.signed_distance(res.x) < 0.02:
                 alt = ls(clamp_inside(wallmap.reflect(res.x, w), [w], 0.05))
                 if w.signed_distance(alt.x) >= 0.02 or alt.cost < res.cost:
@@ -494,7 +517,7 @@ class Tracker:
         return P[int(np.argmax(score))]
 
     # ── background + wall map ─────────────────────────────────────────────────
-    def _update_background(self, raw, obj_paths=None):
+    def _update_background(self, raw, obj_paths=None, residual_env=None):
         upd = np.ones(raw.shape, bool)
         if obj_paths is not None:               # don't absorb the object
             g = int(self.BG_GUARD_M / self.c * self.fs)
@@ -502,6 +525,11 @@ class Tracker:
                 k = int(d / self.c * self.fs)
                 upd[max(k - g, 0):k + self.chirp.n + g, i] = False
         self.bg[upd] += self.BG_ALPHA * (raw[upd] - self.bg[upd])
+        if residual_env is not None and self.noise is not None:
+            u = upd.T
+            # clipped: an undetected object raises the floor only slowly
+            r = np.minimum(residual_env[u], self.NOISE_CLIP * self.noise[u])
+            self.noise[u] += self.NOISE_ALPHA * (r - self.noise[u])
 
     def _map_args(self, bg):
         return ((self.analytic(bg), self.mic_pos, self.tx_pos, self.fs, self.c),
@@ -559,7 +587,10 @@ class Tracker:
             if len(self._cal) < self.CAL_FRAMES:
                 return dict(lat, calibrating=True,
                             cal_progress=len(self._cal) / self.CAL_FRAMES)
-            self.bg, self._cal = np.median(np.stack(self._cal), axis=0), []
+            cal = np.stack(self._cal)
+            self.bg, self._cal = np.median(cal, axis=0), []
+            if self.noise_model == "per_bin":
+                self.noise = np.mean([np.abs(self.analytic(f - self.bg)) for f in cal], axis=0)
             self._set_reference()
             self.map_walls()
             return dict(lat, calibrating=True, cal_progress=1.0)
@@ -571,14 +602,25 @@ class Tracker:
         z = self.analytic(raw - self.bg)
         env = np.abs(z)
         b = int(self.blank_m / self.c * self.fs)
-        noise = np.median(env[:, b:], axis=1) + 1e-12
+        detect_snr, meas_snr = self.DETECT_SNR, self.MEAS_SNR
+        if self.noise is not None:
+            # normalise per delay; envelope below then is in units of noise
+            raw_env = env
+            nb = scipy.ndimage.maximum_filter1d(self.noise, self.NOISE_SPREAD, axis=1)
+            nb = np.maximum(nb, np.median(nb[:, b:], axis=1, keepdims=True)) + 1e-12
+            env = env / nb
+            noise = np.ones(self.n_mics)
+            detect_snr, meas_snr = self.DETECT_SNR_BIN, self.MEAS_SNR_BIN
+        else:
+            raw_env = None
+            noise = np.median(env[:, b:], axis=1) + 1e-12
         snr = env[:, b:].max(axis=1) / noise
         # Detection has two levels: a new track needs a strong echo on most
         # mics (DETECT_SNR, anywhere in the record); an existing track only
         # needs ≥ 3 mics above MEAS_SNR within its gate — so a weak, distant
         # object stays tracked without false alarms in an empty room.
         need = max(3, (self.n_mics + 1) // 2)
-        strong = int(np.sum(snr >= self.DETECT_SNR)) >= need
+        strong = int(np.sum(snr >= detect_snr)) >= need
         lost = self.kf.lost
         out = dict(lat, calibrating=False, detected=False, snr=snr,
                    envs=env.mean(axis=1), accepted=False, cost=float("nan"))
@@ -586,7 +628,7 @@ class Tracker:
         if not strong and lost:                   # empty room: coast, learn
             self.kf.coast(self.dt)
             if self.sync_ok:                      # never learn a misaligned ping
-                self._update_background(raw)
+                self._update_background(raw, residual_env=raw_env)
             return dict(out, pos=self.kf.x[:2].copy(), vel=self.kf.x[2:].copy(),
                         range_m=float("nan"), pos_app=None, pos_est=None,
                         used=np.zeros(self.n_mics, bool))
@@ -600,7 +642,7 @@ class Tracker:
         pred_app = pred_pos + self.chirp.doppler_coupling_s * pred_vel
         gate_m = max(3.0 * pred_std, self.MIN_GATE_M)
         paths, peaks = self.measure_paths(env, pred_app, gate_m)
-        used = peaks / noise >= self.MEAS_SNR
+        used = peaks / noise >= meas_snr
         if used.sum() < 3:
             self.kf.coast(self.dt)
             return dict(out, pos=self.kf.x[:2].copy(), vel=self.kf.x[2:].copy(),
@@ -625,7 +667,7 @@ class Tracker:
         # update the background only while the track is confirmed — otherwise
         # the mask is in the wrong place and the object gets absorbed
         if accepted and not lost and self.sync_ok:
-            self._update_background(raw, obj_paths=self.paths(pos_app))
+            self._update_background(raw, obj_paths=self.paths(pos_app), residual_env=raw_env)
         vel = self.kf.x[2:].copy()
         pos_est = pos_app - self.chirp.doppler_coupling_s * vel
         return dict(out, pos=self.kf.x[:2].copy(), vel=vel, pos_app=pos_app,
