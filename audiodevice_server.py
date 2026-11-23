@@ -56,7 +56,7 @@ class LiveSession:
     """One device session at a time, broadcast to any number of browser clients."""
 
     def __init__(self, serial, band, level, duration=None, stream=None, *,
-                 lidar_port=None, lidar_root=False):
+                 lidar_port=None, lidar_root=False, lidar_stream=None):
         self.serial = serial
         self.band = tuple(band)
         self.level = level
@@ -74,6 +74,7 @@ class LiveSession:
         self._config = None
         self.lidar_port = lidar_port
         self.lidar_root = lidar_root
+        self.lidar_stream = lidar_stream    # None: the device (lidar.stream)
         self.lidar_worker = None
         self.lidar_stop = threading.Event()
         self.lidar_status = {"running": False, "stopping": False, "error": False,
@@ -210,8 +211,9 @@ class LiveSession:
     def _run_lidar(self):
         text, error = "LiDAR stopped; serial settings restored.", False
         try:
-            lidar.stream(self.serial, self.lidar_port, self.lidar_root, self.lidar_stop,
-                         lambda scan: self._publish("lidar", scan))
+            (self.lidar_stream or lidar.stream)(
+                self.serial, self.lidar_port, self.lidar_root, self.lidar_stop,
+                lambda scan: self._publish("lidar", scan))
         except (capture.CaptureError, subprocess.SubprocessError, OSError, ValueError) as exc:
             print(f"LiDAR failed: {exc}", file=sys.stderr)
             text, error = f"LiDAR error: {exc}", True
@@ -387,22 +389,34 @@ def main():
     parser.add_argument("--lidar-port", help="LD-19 serial port on target, e.g. /dev/ttyUSB0")
     parser.add_argument("--lidar-root", action="store_true",
                         help="use target su 0 for serial access; does not change permissions")
+    parser.add_argument("--recording", metavar="STEM",
+                        help="replay a recording (e.g. recordings/walk1) instead of a device")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="replay speed for --recording (default 1 = real time)")
     args = parser.parse_args()
     if not 0 < args.level <= 20:
         parser.error("--level must be greater than 0 and no more than 20")
     if args.seconds is not None and args.seconds < 5:
         parser.error("--seconds must be at least 5")
     try:
-        capture.make_chirp(*args.band)
-        serial = args.serial or capture.connected_serial()
-        session = LiveSession(serial, args.band, args.level, args.seconds,
-                              lidar_port=args.lidar_port, lidar_root=args.lidar_root)
+        if args.recording:
+            import audiodevice_recording as recording
+            player = recording.Player(args.recording, args.speed)
+            serial = f"recording {args.recording}"
+            session = LiveSession(serial, player.band, args.level, args.seconds, player.audio,
+                                  lidar_port="recorded LD-19" if player.rec.scans else None,
+                                  lidar_stream=player.lidar)
+        else:
+            capture.make_chirp(*args.band)
+            serial = args.serial or capture.connected_serial()
+            session = LiveSession(serial, args.band, args.level, args.seconds,
+                                  lidar_port=args.lidar_port, lidar_root=args.lidar_root)
         server = make_server(session, args.host, args.port)
     except (capture.CaptureError, subprocess.SubprocessError, OSError, ValueError) as exc:
         print(f"Unable to start live server: {exc}", file=sys.stderr)
         return 1
 
-    if not is_loopback(args.host):
+    if not is_loopback(args.host) and not args.recording:
         print("WARNING: anyone who can reach this address can start device playback.",
               file=sys.stderr)
     host, port = server.server_address[:2]

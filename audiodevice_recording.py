@@ -120,26 +120,92 @@ def record(stem, seconds, serial, low, high, level, lidar_port=None, lidar_root=
     print(f"{stem}: {sum(len(c) for _, c in chunks) / RATE:.1f} s audio, {len(scans)} scans")
 
 
-def replay(stem, lidar_delay=0.1):
-    """Run :class:`audiodevice_mapper.AudiodeviceMapper` and compare with the LiDAR track."""
+class Player:
+    """Plays a recording in real time (× ``speed``) in place of the device.
+
+    ``audio`` has the signature of ``audiodevice_live_audio.stream`` and
+    ``lidar`` that of ``audiodevice_lidar.stream``, so the GUIs can use them
+    unchanged. Both follow one clock, which restarts when the audio starts, so
+    LiDAR scans stay aligned with the audio as they were recorded."""
+
+    def __init__(self, stem, speed=1.0):
+        self.stem = stem
+        self.rec = load(stem)
+        self.speed = float(speed)
+        if self.speed <= 0:
+            raise ValueError("speed must be positive")
+        self.band = tuple(self.rec.meta.get("band_hz", (18_000, 22_000)))
+        self.seconds = len(self.rec.samples) / RATE
+        self._t0 = self.rec.chunk_times[0] if len(self.rec.chunk_times) else 0.0
+        self._scan_times = np.array([t for t, _ in self.rec.scans]) - self._t0
+        self._origin = None
+        self._lock = threading.Lock()
+
+    def now(self):
+        """Recording time (s since the first chunk) of the playback clock."""
+        with self._lock:
+            if self._origin is None:
+                self._origin = time.monotonic()
+            return (time.monotonic() - self._origin) * self.speed
+
+    def _wait_until(self, t, stop_event):
+        while True:
+            ahead = t - self.now()
+            if ahead <= 0:
+                return
+            if stop_event.wait(min(ahead / self.speed, 0.05)):
+                raise InterruptedError
+
+    def audio(self, _serial, _low, _high, _level, duration, stop_event, on_status, on_samples):
+        with self._lock:
+            self._origin = None
+        on_status(f"Replaying {self.stem} ({self.seconds:.0f} s"
+                  f"{'' if self.speed == 1 else f' at ×{self.speed:g}'}) — no audio is played.")
+        for t, chunk in self.rec.chunks():
+            due = t - self._t0
+            if duration is not None and due > duration:
+                break
+            self._wait_until(due, stop_event)
+            on_samples(chunk)
+
+    def lidar(self, _serial, _port, _root, stop_event, on_scan):
+        last = -1
+        while not stop_event.wait(0.02):
+            i = int(np.searchsorted(self._scan_times, self.now(), side="right")) - 1
+            if i >= 0 and i != last and i < len(self.rec.scans):
+                on_scan(self.rec.scans[i][1])
+                last = i
+
+
+def angle_offset(rec):
+    """The mapper's angle calibration is for the real device; simulated audio
+    (recording_sim.py) has no such bias."""
+    return 0.0 if rec.meta.get("simulated_from") else None
+
+
+def evaluate(rec, lidar_delay=0.1, **mapper_args):
+    """Run :class:`audiodevice_mapper.AudiodeviceMapper` on a loaded recording and
+    compare with the LiDAR track. Returns a dict of metrics plus per-ping ``rows``
+    ``(t, depth, right)`` (NaN where nothing is tracked)."""
     import audiodevice_mapper
 
-    rec = load(stem)
     low, high = rec.meta.get("band_hz", (18_000, 22_000))
-    mapper = audiodevice_mapper.AudiodeviceMapper(low, high)
-    rows, start, pings = [], time.perf_counter(), 0
+    mapper_args.setdefault("angle_offset_deg", angle_offset(rec))
+    mapper = audiodevice_mapper.AudiodeviceMapper(low, high, **mapper_args)
+    rows, start, pings, frame = [], time.perf_counter(), 0, None
     for _, chunk in rec.chunks():
         for frame in mapper.push(chunk):
             pings += 1
             if frame.state in ("locking", "calibrating"):
                 continue
             rows.append((rec.sample_time(frame.sample_index), *(frame.position or (np.nan, np.nan))))
-    elapsed = time.perf_counter() - start
-    print(f"{len(rec.samples) / RATE:.1f} s, {pings} pings, {1e3 * elapsed / max(pings, 1):.1f} ms/ping, "
-          f"facing wall {frame.facing_wall_m}")
+    out = dict(seconds=len(rec.samples) / RATE, pings=pings,
+               ms_per_ping=1e3 * (time.perf_counter() - start) / max(pings, 1),
+               facing_wall_m=frame.facing_wall_m if frame else None,
+               rows=np.array(rows).reshape(-1, 3))
     if not rows or rec.track is None:
-        return
-    t, depth, right = np.array(rows).T
+        return out
+    t, depth, right = out["rows"].T
     track = rec.track[~np.isnan(rec.track[:, 1])]
     truth = [np.interp(t + lidar_delay, track[:, 0], track[:, k], left=np.nan, right=np.nan)
              for k in (1, 2)]
@@ -147,11 +213,27 @@ def replay(stem, lidar_delay=0.1):
     both = present & found
     range_err = np.abs(np.hypot(depth, right) - np.hypot(*truth))[both]
     lateral_err = np.abs(right - truth[1])[both]
-    print(f"target present {present.sum()} pings: tracked {100 * found[present].mean():.0f}%, "
-          f"range error median {np.median(range_err):.2f} m p90 {np.percentile(range_err, 90):.2f} m, "
-          f"lateral error median {np.median(lateral_err):.2f} m p90 {np.percentile(lateral_err, 90):.2f} m")
-    if (~present).any():
-        print(f"target absent {(~present).sum()} pings: false tracks {100 * found[~present].mean():.1f}%")
+    out.update(present=int(present.sum()), absent=int((~present).sum()),
+               tracked=float(found[present].mean()) if present.any() else np.nan,
+               false_tracks=float(found[~present].mean()) if (~present).any() else np.nan,
+               range_err=range_err, lateral_err=lateral_err)
+    return out
+
+
+def replay(stem, lidar_delay=0.1):
+    """Run :class:`audiodevice_mapper.AudiodeviceMapper` and compare with the LiDAR track."""
+    m = evaluate(load(stem), lidar_delay)
+    print(f"{m['seconds']:.1f} s, {m['pings']} pings, {m['ms_per_ping']:.1f} ms/ping, "
+          f"facing wall {m['facing_wall_m']}")
+    if "present" not in m:
+        return
+    re, le = m["range_err"], m["lateral_err"]
+    if m["present"]:
+        print(f"target present {m['present']} pings: tracked {100 * m['tracked']:.0f}%, "
+              f"range error median {np.median(re):.2f} m p90 {np.percentile(re, 90):.2f} m, "
+              f"lateral error median {np.median(le):.2f} m p90 {np.percentile(le, 90):.2f} m")
+    if m["absent"]:
+        print(f"target absent {m['absent']} pings: false tracks {100 * m['false_tracks']:.1f}%")
 
 
 def main():

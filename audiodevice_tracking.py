@@ -18,12 +18,19 @@ HOP = PERIOD
 CALIBRATION_UPDATES = 4
 REFERENCE_CHANNEL = 1
 
-# Coordinates are (depth from the speaker, lateral offset from device centre).
-TX_POSITION = np.array([0.0, -0.19])
+# Coordinates are (depth from the speaker, lateral offset from device centre),
+# lateral positive to the RIGHT seen from behind the device looking into the
+# room (the LiDAR's frame). The speaker is at the right end; along the bar from
+# it: mic 2 (11 cm), mic 4 (27 cm), mic 0 (43 cm). This is the supplied table
+# mirrored (it was given as seen from the front) with channels 0 and 4 swapped,
+# found from recordings/walk1 (LiDAR walker and direct-sound arrival order) and
+# confirmed on the hardware. Rear mics (1, 3, 5) are assumed to sit behind
+# 0, 2, 4 as in the table; that pairing is not verified.
+TX_POSITION = np.array([0.0, 0.19])
 MIC_POSITIONS = np.array([
-    [0.0, 0.27 - 0.19], [-0.035, 0.27 - 0.19],
-    [0.0, 0.11 - 0.19], [-0.035, 0.11 - 0.19],
-    [0.0, 0.43 - 0.19], [-0.035, 0.43 - 0.19],
+    [0.0, 0.19 - 0.43], [-0.035, 0.19 - 0.43],
+    [0.0, 0.19 - 0.11], [-0.035, 0.19 - 0.11],
+    [0.0, 0.19 - 0.27], [-0.035, 0.19 - 0.27],
 ])
 
 

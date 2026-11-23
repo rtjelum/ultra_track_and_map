@@ -52,6 +52,18 @@ them through `audiodevice_mapper.AudiodeviceMapper` against the LiDAR walker tra
 .venv/bin/python audiodevice_recording.py replay recordings/walk1
 ```
 
+To watch a recording in a GUI, replay it in place of the device, with no
+device or ADB needed and no audio played. Then press **Start** (and **Start
+LiDAR** for the recorded scans) as in a live session:
+
+```sh
+.venv/bin/python audiodevice_server.py --recording recordings/walk1      # browser, http://localhost:8765/
+.venv/bin/python audiodevice_live.py --recording recordings/walk1_sim    # Matplotlib window
+```
+
+`--speed 2` replays twice as fast. Both GUIs run their own live tracker
+(`audiodevice_tracking`), not the `AudiodeviceMapper` that `replay` scores.
+
 Audio is stored losslessly as 24-bit six-channel FLAC (`STEM.flac`); chunk host
 times, LiDAR scans, an optional walker track and metadata go in `STEM.npz`
 (see the module docstring). LiDAR scans are timestamped on arrival, about 0.1 s
@@ -61,9 +73,10 @@ after the matching ping; replay compensates for this.
 zero angle forward) holds a still device with the room empty for 0–5 s, one person
 walking in front of it for 5–29 s, and an empty room after about 30 s. Its
 `track` was extracted from LiDAR points that differ from the empty-room scans.
-Replay gives 69% of target pings tracked, range error median 0.04 m (p90
-0.16 m), lateral error median 0.27 m (p90 0.97 m), and a facing wall at 4.32 m
-(LiDAR about 4.3 m). The 2% of target-absent pings with tracks are coasting
-just after the walker leaves.
+Replay gives 69% of target pings tracked, range error median 0.05 m (p90
+0.16 m), lateral error median 0.22 m (p90 0.56 m), no false tracks, and a
+facing wall at 4.32 m (LiDAR about 4.3 m). Before the mic-layout correction and
+the new angle estimate (see the README), lateral error was 0.27 m (p90 0.97 m)
+and 2% of target-absent pings had tracks.
 
 Protocol reference: [LDROBOT SDK packet layout and decoder](https://github.com/ldrobotSensorTeam/ldlidar_stl_sdk/tree/master/ldlidar_driver/src/dataprocess).

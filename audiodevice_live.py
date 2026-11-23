@@ -26,7 +26,8 @@ connected_serial = capture.connected_serial
 
 
 class LiveDemo:
-    def __init__(self, serial, band, level, duration=None):
+    def __init__(self, serial, band, level, duration=None, stream=None):
+        self.stream = stream            # None: the device (audio.stream)
         self.serial = serial
         self.band = band
         self.level = level
@@ -188,8 +189,8 @@ class LiveDemo:
                         calibrated |= frame.calibration == tracker.CALIBRATION_UPDATES
                     self.messages.put(("frame", frame))
 
-            audio.stream(self.serial, *self.band, self.level, self.duration,
-                         self.stop_event, on_status, on_samples)
+            (self.stream or audio.stream)(self.serial, *self.band, self.level, self.duration,
+                                          self.stop_event, on_status, on_samples)
         except InterruptedError:
             self.messages.put(("done", "Stopped; device cleanup finished."))
             reported = True
@@ -320,6 +321,10 @@ def main():
                         help="digital peak percentage (default 1; maximum 20)")
     parser.add_argument("--seconds", type=int,
                         help="optional session length in seconds (default: run until Stop)")
+    parser.add_argument("--recording", metavar="STEM",
+                        help="replay a recording (e.g. recordings/walk1) instead of a device")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="replay speed for --recording (default 1 = real time)")
     args = parser.parse_args()
     if not 0 < args.level <= 20:
         parser.error("--level must be greater than 0 and no more than 20")
@@ -329,8 +334,14 @@ def main():
         capture.make_chirp(*args.band)
         if matplotlib.get_backend().lower() in {"agg", "pdf", "ps", "svg", "cairo", "template"}:
             raise capture.CaptureError("An interactive Matplotlib display is required")
-        serial = args.serial or connected_serial()
-        demo = LiveDemo(serial, args.band, args.level, args.seconds)
+        if args.recording:
+            import audiodevice_recording as recording
+            player = recording.Player(args.recording, args.speed)
+            demo = LiveDemo(f"recording {args.recording}", player.band, args.level,
+                            args.seconds, player.audio)
+        else:
+            serial = args.serial or connected_serial()
+            demo = LiveDemo(serial, args.band, args.level, args.seconds)
         previous_handler = signal.getsignal(signal.SIGTERM)
         def interrupt(_signum, _frame):
             raise KeyboardInterrupt

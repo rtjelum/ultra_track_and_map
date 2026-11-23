@@ -267,6 +267,14 @@ depth behind the speaker. Channel numbers are zero-based:
 The device center is 19 cm to the right of the speaker. These supplied
 coordinates have not yet been validated by a position-tracking test.
 
+**Correction (checked against walk1 and confirmed on the hardware).** Looking
+into the room from behind the device, the speaker is at the *right* end of the
+bar. From the speaker the order along the bar is mic 2 (11 cm), mic 4 (27 cm),
+then mic 0 (43 cm). The table above is mirrored (it was written as seen from the
+front) and has channels 0 and 4 swapped. `audiodevice_tracking.py` uses the
+corrected layout. The rear mics are assumed to sit behind 0, 2 and 4 as listed;
+that pairing is not verified.
+
 From this directory, with this checkout inside `platform_dsp_qcs`:
 
 ```sh
@@ -376,3 +384,127 @@ any session and restores the device first.
 Both the GUI and the server batch the mixer reads and writes for the
 microphone route into single ADB calls, so opening and restoring the route
 takes about 2 seconds rather than about 10.
+
+## Simulating a recording
+
+`recording_sim.py` rebuilds a recorded Audiodevice session (see
+[docs/lidar.md](docs/lidar.md#recordings)) as a simulation, then synthesises
+the six microphone channels. That way the tracker can be developed against
+synthetic audio of the real room and the real walk:
+
+```sh
+.venv/bin/python recording_sim.py recordings/walk1          # → recordings/walk1_sim.{flac,npz,png}
+.venv/bin/python audiodevice_recording.py replay recordings/walk1_sim
+.venv/bin/python recording_sim.py recordings/walk1 --no-fade --seed 3   # ablations, other noise draws
+.venv/bin/python compare_view.py recordings/walk1                       # recording vs simulation, side by side
+```
+
+`compare_view.py` replays both through the mapper with the LiDAR walker as
+ground truth: the scene, range over time and the range profiles, in sync.
+Keys: space pauses, ←/→ jump 1 s, +/- change speed, and the slider scrubs.
+
+Where each part of the model comes from:
+
+- **Room:** walls fitted to the empty-room LiDAR scans, with first- and
+  second-order specular echoes. Every LiDAR point also scatters weakly. Echoes
+  the 2D model can't produce (ceiling, floor, things outside the LiDAR plane)
+  are fitted from the recording and added (`--static physical` leaves them
+  out).
+- **Device:** speaker→mic coupling, per-mic gains and noise, fitted from the
+  empty-room part of the recording.
+- **Person:** follows the LiDAR walker track. The body is an extended set of
+  scatterers (speckle) and the echo includes Doppler. The echo strength and its
+  fall-off with range are fitted, including the weaker echo below ~1 m. Slow
+  fades (body aspect) and shadowing of the static echoes behind the person are
+  modelled too.
+- **Static drift:** each static echo's phase wanders slowly, in proportion to
+  its path length, mostly in common across the mics.
+
+The simulated recording has the same format, chunk timing and LiDAR ground
+truth as the original. The script runs the mapper on both recordings and
+plots a comparison:
+
+![walk1: recording vs simulation](docs/walk1_sim.png)
+
+| walk1 | tracked | range error median / p90 | lateral error median / p90 | false tracks | facing wall |
+|---|---:|---:|---:|---:|---:|
+| recording | 69% | 0.05 / 0.16 m | 0.22 / 0.56 m | 0.0% | 4.32 m |
+| simulation (seed 0) | 95% | 0.05 / 0.14 m | 0.15 / 0.46 m | 2.6% | 4.31 m |
+
+Fitting and checking used the same recording. The signal statistics match by
+construction: static echoes, noise floor, person echo strength by range,
+fading, drift and shadowing. The tracking results were not fitted, so they are
+the real check. Range error and the facing wall agree. Lateral error is lower
+in the simulation: the real device's angle has a bias of about −8° (corrected by
+the mapper's `ANGLE_OFFSET_DEG`) that varies along the walk, and its cause is not
+known. The simulation has no such bias, so it is scored without the correction.
+
+The simulation tracks the person more often than the recording does (84–97%
+across seeds). Most of the difference comes from one 4-second stretch on the
+walker's return along the left side, where the real echo stays 2–3× weaker.
+One walk can't show whether that is a property of the position or chance; a
+second recording would show which.
+
+What the ablations show, from single runs:
+
+- Slow echo fades cause most of the missed detections (95% tracked without
+  them).
+- Lateral accuracy depended on the angle estimator, not on how noisy the room
+  is. Before the mic-layout correction and the integrated angle estimate (see
+  "Mapper angle estimate" below), lateral error stayed at 0.3–0.45 m even with
+  every effect turned off.
+
+### Mapper angle estimate
+
+The 3 front mics span 32 cm. Across the walker's angles the echo arrives at
+the two end mics at most about 7 samples apart. In one ping, each mic's echo
+peak scatters by about 20 samples (speckle from an extended body). The mapper
+used to pick the angle per ping, from envelopes max-filtered over 15 samples,
+and its lateral estimate was nearly uncorrelated with the LiDAR (correlation
++0.12). It is now:
+
+- **Delay-and-sum of the unfiltered envelopes** along each direction, over
+  ±0.2 m of range, so the whole echo votes and not one speckle peak. Only
+  products of mic pairs are summed, so a noise burst on one mic can't pull the
+  angle towards itself.
+- **Integrated over the last 5 pings** (`ANGLE_INTEGRATE`), like the range
+  detection, before the Kalman update.
+- **Run on the corrected mic layout** (above).
+- **Calibrated by +8°** against the LiDAR (`ANGLE_OFFSET_DEG`). On the two
+  halves of walk1 the bias was −12.6° and −3.6°, so the correction is uncertain
+  by about ±5°. The LiDAR's yaw is not the cause: it sees the device bar square
+  to within about 1°.
+
+On walk1, lateral error went from 0.27 to 0.22 m (median) and from 0.97 to
+0.56 m (p90). Estimates on the wrong side of the device went from 34% to 21%,
+and false tracks from 2.2% to 0%. Range error and the tracked fraction are
+unchanged. `ANGLE_METHOD = "legacy"` restores the old estimate.
+
+The mapper uses only the 3 front mics. Adding the rear mics (1, 3, 5) made
+everything worse on walk1. With all 6 used for detection, only 33% of target
+pings were tracked instead of 69%: they are 3–7× noisier and dilute the echo.
+With detection on the front mics and all 6 used for the angle, lateral
+correlation fell from +0.24 to +0.14 (an offline test of the angle step alone).
+The rear mics alone carry no angle information for any of the 6 ways they could
+sit behind the front ones. They are 3.5 cm behind the front mics and add no
+lateral aperture. The browser and
+Matplotlib GUIs still use the separate live tracker in `audiodevice_tracking.py`,
+not the mapper.
+
+## Lidar viewer
+
+`lidar.py` reads an LDROBOT LD06 / LD19 2D lidar (CP2102 USB-UART, 230400
+baud) and shows the live scan:
+
+```bash
+python lidar.py                                  # first /dev/cu.usbserial-* port
+python lidar.py --port /dev/cu.usbserial-0001 --range 4
+```
+
+Points are coloured by intensity, with a faint trail of the last 10 scans.
+Keys: `+`/`-` or scroll to zoom, space to pause, `t` to toggle the trail,
+`s` to save the scan as `.npz`, `q` to quit. The x axis is the lidar's
+0° direction, with angles counter-clockwise like the rest of the project.
+
+To use it from code, `LD06()` runs a background reader. `latest()` returns
+the newest full revolution, and `.xy()` gives its points in metres.

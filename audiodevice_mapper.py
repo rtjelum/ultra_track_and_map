@@ -86,9 +86,17 @@ class AudiodeviceMapper:
     STATIC_S = 8.0           # a track that doesn't move this long is absorbed
     STATIC_TOL = 0.12        # m, range spread that counts as not moving
     RANGE_STEP = 0.02
+    ANGLE_WINDOW = 0.2       # m: ± range over which the mics' envelopes are aligned
+    ANGLE_METHOD = "pairs"   # delay-and-sum of unsmoothed envelopes, integrated over
+                             # ANGLE_INTEGRATE pings; "legacy": per-ping, max-filtered
+    ANGLE_INTEGRATE = 5      # pings whose angle evidence is summed (one ping is too noisy)
+    # "pairs": constant correction added to the measured angle, calibrated against
+    # the LiDAR on walk1 (bias −12.6° on its first half, −3.6° on its second; ±5°).
+    # Cause not found: not the LiDAR yaw (it sees the device bar square, ±1°).
+    ANGLE_OFFSET_DEG = 8.0
 
     def __init__(self, low_hz=18_000, high_hz=22_000, *, channels=FRONT_CHANNELS,
-                 max_range_m=4.0, lock_offset=LOCK_OFFSET,
+                 max_range_m=4.0, lock_offset=LOCK_OFFSET, angle_offset_deg=None,
                  heat_depths=None, heat_laterals=None):
         self.channels = list(channels)
         self.chirp = T.Chirp(fs=capture.RATE, f0=low_hz, f1=high_hz)
@@ -96,6 +104,8 @@ class AudiodeviceMapper:
         self.tx_pos = geometry.TX_POSITION
         self.max_range_m = max_range_m
         self.lock_offset = lock_offset
+        if angle_offset_deg is not None:      # e.g. 0 for simulated audio, which lacks the bias
+            self.ANGLE_OFFSET_DEG = angle_offset_deg
         self.dt = PERIOD / capture.RATE
         self.k_per_m = capture.RATE / T.C
         self._lock_tracker = T.Tracker(geometry.MIC_POSITIONS, self.tx_pos, self.chirp,
@@ -136,6 +146,7 @@ class AudiodeviceMapper:
         self._cal = []
         self.facing_wall = None
         self.history = deque(maxlen=self.INTEGRATE)
+        self.angle_history = deque(maxlen=self.ANGLE_INTEGRATE)
         self.recent_raw = deque(maxlen=20)
         self.static_ranges = deque(maxlen=int(round(self.STATIC_S / self.dt)))
         self.heat = None
@@ -257,7 +268,7 @@ class AudiodeviceMapper:
         if found:
             rng = float(self.ranges[i])
             prior = None if lost else pred
-            z = self._angle_fix(spread, rng, prior)
+            z = self._angle_fix(spread, rng, prior, en)
             R = self._polar_covariance(z)
             if lost:
                 kf.reset(z)
@@ -346,9 +357,18 @@ class AudiodeviceMapper:
             best[better], speed[better] = acc[better], v
         return best, speed
 
-    def _angle_fix(self, spread, rng, prior):
+    def _angle_fix(self, spread, rng, prior, en=None):
         """Point on the arc at range rng (from the array centre) where the
-        mics' echoes line up best, nudged towards the prediction."""
+        mics' echoes line up best, nudged towards the prediction.
+
+        "pairs": the per-mic envelopes (noise-normalised, not max-filtered:
+        the angle is in delay differences of only a few samples across the
+        aperture) are delay-and-summed along each direction over ±ANGLE_WINDOW
+        of range, so the whole extended echo votes, not one speckle peak.
+        Only cross-products of mic pairs count, so one mic's noise burst
+        can't pull the angle towards itself."""
+        if self.ANGLE_METHOD == "pairs" and en is not None:
+            return self._angle_fix_pairs(en, rng, prior)
         centre = self.tracker.centre
         pts = centre + rng * np.stack([np.cos(self._angles), np.sin(self._angles)], axis=1)
         mics = np.arange(len(self.channels))[:, None]
@@ -358,6 +378,31 @@ class AudiodeviceMapper:
             a0 = np.arctan2(prior[1] - centre[1], prior[0] - centre[0])
             score -= 0.5 * ((self._angles - a0) / (2 * self.ANGLE_SIGMA))**2
         return pts[int(np.argmax(score))]
+
+    def _angle_fix_pairs(self, en, rng, prior):
+        centre = self.tracker.centre
+        dr = np.arange(-self.ANGLE_WINDOW, self.ANGLE_WINDOW + 1e-9, self.RANGE_STEP)
+        u = np.stack([np.cos(self._angles), np.sin(self._angles)], axis=1)
+        pts = centre + (rng + dr[:, None, None]) * u[None]              # (ranges, angles, 2)
+        d_tx = np.linalg.norm(pts - self.tx_pos, axis=-1)
+        e = []
+        for j, mic in enumerate(self.mic_pos):
+            k = (d_tx + np.linalg.norm(pts - mic, axis=-1)) * self.k_per_m
+            k0 = np.clip(np.floor(k).astype(int), 0, en.shape[1] - 2)
+            f = k - k0
+            e.append(en[j, k0] * (1 - f) + en[j, k0 + 1] * f)
+        n = len(e)
+        s = sum(e[a] * e[b] for a in range(n) for b in range(a + 1, n)).sum(axis=0)
+        if prior is None:                       # new track: old evidence is someone else's
+            self.angle_history.clear()
+        self.angle_history.append((s - s.mean()) / (s.std() + 1e-12))
+        s = np.sum(self.angle_history, axis=0)
+        off = np.radians(self.ANGLE_OFFSET_DEG)
+        if prior is not None:
+            a0 = np.arctan2(prior[1] - centre[1], prior[0] - centre[0]) - off
+            s = s - 0.5 * ((self._angles - a0) / (2 * self.ANGLE_SIGMA))**2
+        a = self._angles[int(np.argmax(s))] + off
+        return centre + rng * np.array([np.cos(a), np.sin(a)])
 
     def _polar_covariance(self, z):
         d = z - self.tracker.centre
