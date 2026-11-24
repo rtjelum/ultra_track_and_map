@@ -19,13 +19,14 @@ matplotlib.use("Agg")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-from PIL import Image
 
 import audiodevice_live as L
 import audiodevice_recording as R
 import compare_view as CV
+import gifsave
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -82,15 +83,6 @@ def overlay(t):
     truth_art.set_data([now[1]], [now[0]])
 
 
-def grab():
-    fig = demo.figure
-    fig.canvas.draw()
-    img = Image.frombuffer("RGBA", fig.canvas.get_width_height(),
-                           fig.canvas.buffer_rgba()).convert("RGB")
-    w, h = img.size
-    return img.resize((args.width, round(h * args.width / w)), Image.LANCZOS)
-
-
 frames, next_t, last = [], args.start, None
 for t, chunk in rec.chunks():
     t -= t0
@@ -102,26 +94,10 @@ for t, chunk in rec.chunks():
     if t >= next_t and last is not None:
         overlay(t)
         demo.status.set_text(f"t = {t:5.1f} s   " + demo.status.get_text().split("   ")[-1])
-        frames.append(grab())
+        frames.append(gifsave.grab(demo.figure, args.width))
         next_t += args.step
 
-# one shared palette, as in make_gif.py, with the GUI's key colours kept exact
-keys = ["#101722", "#1a2533", "#ffae42", "#fa6d6d", "#8bd17c", "#44c2ad", "#89aaff",
-        "#d599f0", "#40dcff", "#4cd1ff", "#ffd36b", "#f2a7c3", "#3ccf5a", "#9aa5b1",
-        "#87e0cb", "#ffcc80", "#ffffff"]
-w, h = frames[0].size
-picks = sorted({0, len(frames) // 3, 2 * len(frames) // 3, len(frames) - 1})
-sheet = Image.new("RGB", (w, h * len(picks) + 40))
-for i, k in enumerate(picks):
-    sheet.paste(frames[k], (0, h * i))
-sw = w // len(keys)
-for i, c in enumerate(keys):
-    sheet.paste(Image.new("RGB", (sw, 40), c), (i * sw, h * len(picks)))
-pal = sheet.quantize(colors=96, method=Image.Quantize.MEDIANCUT)
-q = [fr.quantize(palette=pal, dither=Image.Dither.NONE) for fr in frames]
-
-os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-q[0].save(args.out, save_all=True, append_images=q[1:],
-          duration=int(round(1000 * args.step / args.speed)), loop=0, optimize=True)
-print(f"wrote {args.out}  ({w}×{h}, {len(q)} frames, "
-      f"{os.path.getsize(args.out) / 1024:.0f} KB)")
+gifsave.save(frames, args.out, 1000 * args.step / args.speed, keys=[
+    "#101722", "#1a2533", "#ffae42", "#fa6d6d", "#8bd17c", "#44c2ad", "#89aaff", "#d599f0",
+    "#40dcff", "#4cd1ff", "#ffd36b", "#f2a7c3", "#3ccf5a", "#9aa5b1", "#87e0cb", "#ffcc80",
+    "#ffffff"])

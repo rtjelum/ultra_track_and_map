@@ -418,6 +418,13 @@ synthetic audio of the real room and the real walk:
 ground truth: the scene, range over time, each front mic's echo (the change
 from the empty-room background, in units of that mic's noise, as in
 `audiodevice_live.py`) and the range profiles, in sync.
+
+![compare_view: walk1 recording vs simulation, LiDAR as truth](docs/compare_walk1.gif)
+
+*`compare_view.py` over the walk in walk1 (real time). Orange = recording,
+blue = simulation, green = LiDAR walker. Regenerate with
+`python tools/make_compare_gif.py` (writes `docs/compare_walk1.gif`; needs
+`recordings/walk1_sim` from `recording_sim.py`).*
 It loops over the walking part by default; `l` toggles looping and
 `--no-loop` plays the whole recording once. Keys: space pauses, ←/→ jump 1 s,
 +/- change speed, and the slider scrubs.

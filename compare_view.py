@@ -80,27 +80,19 @@ def lidar_xy(points):
     return np.column_stack([p[:, 1] * np.cos(a), p[:, 1] * np.sin(a)])
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stem", help="the real recording, e.g. recordings/walk1")
-    ap.add_argument("--sim", help="the simulated recording (default STEM_sim)")
-    ap.add_argument("--no-sim", action="store_true", help="show the recording only")
-    ap.add_argument("--speed", type=float, default=1.0)
-    ap.add_argument("--no-loop", action="store_true",
-                    help="play the whole recording once instead of looping the walk")
-    a = ap.parse_args()
-    sim_stem = a.sim or f"{a.stem}_sim"
-    if not a.no_sim and not os.path.exists(sim_stem + ".flac"):
-        raise SystemExit(f"{sim_stem}.flac not found — run: python recording_sim.py {a.stem}")
+def build(stem, sim_stem=None):
+    """Track ``stem`` (and ``sim_stem`` unless None) and lay out the figure.
 
+    Returns ``(fig, draw, t_end, loop_span)``: ``draw(t)`` shows recording time
+    ``t``, ``loop_span`` is the walk (1 s before the LiDAR walker appears to 1 s
+    after they leave)."""
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Slider
 
+    no_sim = sim_stem is None
     print("tracking …", flush=True)
-    real_rec = R.load(a.stem)
+    real_rec = R.load(stem)
     runs = {"recording": run_mapper(real_rec)}
-    if not a.no_sim:
+    if not no_sim:
         runs["simulation"] = run_mapper(R.load(sim_stem))
     t_end = min(r["t"][-1] for r in runs.values())
     t0_chunk = real_rec.chunk_times[0]
@@ -120,10 +112,9 @@ def main():
     plt.rcParams["keymap.back"] = []
     plt.rcParams["keymap.forward"] = []
     fig = plt.figure(figsize=(16, 9.5))
-    fig.canvas.manager.set_window_title(f"{a.stem}: recording" + ("" if a.no_sim else " vs simulation"))
     gs = fig.add_gridspec(2, 3, height_ratios=[1.6, 1], left=0.04, right=0.98,
                           top=0.95, bottom=0.11, hspace=0.25, wspace=0.18)
-    maps = ({"recording": fig.add_subplot(gs[0, 0:2])} if a.no_sim else
+    maps = ({"recording": fig.add_subplot(gs[0, 0:2])} if no_sim else
             {"recording": fig.add_subplot(gs[0, 0]), "simulation": fig.add_subplot(gs[0, 1])})
     ax_rt = fig.add_subplot(gs[0, 2])
     ax_ec = fig.add_subplot(gs[1, 0:2])
@@ -225,18 +216,10 @@ def main():
     ax_pr.grid(alpha=0.5)
     ax_pr.legend(fontsize=8, facecolor="#000", edgecolor="none", loc="upper right")
 
-    ax_sl = fig.add_axes([0.08, 0.03, 0.74, 0.025], facecolor="#2a2d31")
-    slider = Slider(ax_sl, "time (s)", 0, t_end, valinit=0, color="#555")
-    slider.label.set_color("#ddd")
-    slider.valtext.set_color("#ddd")
     walk = np.where(~np.isnan(truth_xy[:, 0]))[0]
     loop_span = ((max(0.0, truth_t[walk[0]] - 1.0), min(t_end, truth_t[walk[-1]] + 1.0))
                  if len(walk) else (0.0, t_end))
-    loop_band = ax_rt.axvspan(*loop_span, color="#fff", alpha=0.06)
-    state = dict(t=loop_span[0] if not a.no_loop else 0.0, playing=True, speed=a.speed,
-                 wall=time.monotonic(), setting=False, loop=not a.no_loop)
-    loop_band.set_visible(state["loop"])
-    status = fig.text(0.90, 0.035, "", fontsize=10, family="monospace")
+    fig.loop_band = ax_rt.axvspan(*loop_span, color="#fff", alpha=0.06)
 
     def draw(t):
         i_scan = int(np.searchsorted(scan_t, t, side="right")) - 1
@@ -279,6 +262,41 @@ def main():
         else:
             truth_ticks.set_data([], [])
         cursor.set_xdata([t, t])
+
+    return fig, draw, t_end, loop_span
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("stem", help="the real recording, e.g. recordings/walk1")
+    ap.add_argument("--sim", help="the simulated recording (default STEM_sim)")
+    ap.add_argument("--no-sim", action="store_true", help="show the recording only")
+    ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--no-loop", action="store_true",
+                    help="play the whole recording once instead of looping the walk")
+    a = ap.parse_args()
+    sim_stem = None if a.no_sim else a.sim or f"{a.stem}_sim"
+    if sim_stem and not os.path.exists(sim_stem + ".flac"):
+        raise SystemExit(f"{sim_stem}.flac not found — run: python recording_sim.py {a.stem}")
+
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Slider
+
+    fig, draw_view, t_end, loop_span = build(a.stem, sim_stem)
+    fig.canvas.manager.set_window_title(f"{a.stem}: recording" + ("" if a.no_sim else " vs simulation"))
+    ax_sl = fig.add_axes([0.08, 0.03, 0.74, 0.025], facecolor="#2a2d31")
+    slider = Slider(ax_sl, "time (s)", 0, t_end, valinit=0, color="#555")
+    slider.label.set_color("#ddd")
+    slider.valtext.set_color("#ddd")
+    loop_band = fig.loop_band
+    state = dict(t=loop_span[0] if not a.no_loop else 0.0, playing=True, speed=a.speed,
+                 wall=time.monotonic(), setting=False, loop=not a.no_loop)
+    loop_band.set_visible(state["loop"])
+    status = fig.text(0.90, 0.035, "", fontsize=10, family="monospace")
+
+    def draw(t):
+        draw_view(t)
         status.set_text(f"{'▶' if state['playing'] else '❚❚'} ×{state['speed']:g}"
                         f"{'  loop' if state['loop'] else ''}")
         state["setting"] = True
