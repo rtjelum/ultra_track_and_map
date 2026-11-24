@@ -316,6 +316,13 @@ background's strongest echo; it is the one wall the 3-mic line can place
 reliably. Walls, chairs and other static objects are otherwise subtracted as
 background, which is why the map shows only what moves.
 
+![Audiodevice live demo replaying walk1, with the LiDAR as ground truth](docs/live_walk1.gif)
+
+*The live demo GUI replaying the walk1 recording (4–30 s, real time) through
+the same `LiveMapper`. Added for the GIF only: grey dots = LiDAR scan, green ring
+and trail = LiDAR walker. Cyan/orange dot = the mapper's candidate. Regenerate
+with `python tools/make_live_gif.py` (writes `docs/live_walk1.gif`).*
+
 Use the same device, routing and safety prerequisites as the capture
 experiment above. From this directory, after running `./setupenv.sh`:
 
