@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import fftconvolve, hilbert
+from scipy.signal import fftconvolve, hilbert, iirnotch, lfilter
 
 import audiodevice_capture as capture
 import tracking
@@ -17,6 +17,35 @@ PINGS_PER_UPDATE = 5
 HOP = PERIOD
 CALIBRATION_UPDATES = 4
 REFERENCE_CHANNEL = 1
+NOTCH_Q = 30
+DEFAULT_NOTCH_HZ = 21_000.0
+
+
+def notch_frequencies(requested):
+    """Resolve --notch values: None means the default; 0 disables notching."""
+    if requested is None:
+        return [DEFAULT_NOTCH_HZ]
+    return [frequency for frequency in requested if frequency != 0]
+
+
+class NotchFilter:
+    """Filter six-channel audio continuously across input chunks."""
+
+    def __init__(self, frequencies):
+        self.notches = []
+        for frequency in frequencies:
+            if not 0 < frequency < capture.RATE / 2:
+                raise ValueError("Notch frequency must be between 0 Hz and 24 kHz")
+            b, a = iirnotch(frequency, NOTCH_Q, capture.RATE)
+            self.notches.append((b, a, np.zeros((len(a) - 1, 6))))
+
+    def push(self, samples):
+        if not len(samples):
+            return samples
+        for index, (b, a, state) in enumerate(self.notches):
+            samples, state = lfilter(b, a, samples, axis=0, zi=state)
+            self.notches[index] = (b, a, state)
+        return samples.astype(np.float32, copy=False)
 
 # Coordinates are (depth from the speaker, lateral offset from device centre),
 # lateral positive to the RIGHT seen from behind the device looking into the
@@ -50,9 +79,11 @@ class TrackingFrame:
 class AudiodeviceTracker:
     """Track changes from a stationary background, not calibrated ground truth."""
 
-    def __init__(self, low_hz=18_000, high_hz=22_000):
+    def __init__(self, low_hz=18_000, high_hz=22_000, notch_hz=(), raw=False):
         chirp = capture.make_chirp(low_hz, high_hz)
         self.reference = chirp * np.hanning(len(chirp))
+        self.raw = raw
+        self.notch_filter = NotchFilter(notch_hz)
         self.buffer = np.empty((0, 6), dtype=np.float32)
         self.anchor = None
         self.pending_anchor = None
@@ -82,13 +113,14 @@ class AudiodeviceTracker:
         self.pending_count = 0
         self.reset_calibration()
 
-    def _score(self, envelopes):
+    def _score(self, envelopes, noise_floor=None):
+        noise_floor = self.noise if noise_floor is None else noise_floor
         indices = np.arange(PERIOD)
         ratios = np.empty(self.delay_samples.shape)
         for ch in range(6):
             delay = self.delay_samples[..., ch]
             signal = np.interp(delay, indices, envelopes[:, ch], left=0, right=0)
-            noise = np.interp(delay, indices, self.noise[:, ch], left=np.inf, right=np.inf)
+            noise = np.interp(delay, indices, noise_floor[:, ch], left=np.inf, right=np.inf)
             ratios[..., ch] = signal / noise
         scores = np.mean(np.log1p(ratios), axis=-1)
         return scores, ratios
@@ -156,6 +188,12 @@ class AudiodeviceTracker:
             return TrackingFrame("syncing", quality, 0)
         aligned *= np.conj(direct) / abs(direct)
 
+        if self.raw:
+            envelopes = np.abs(aligned)
+            floor = np.maximum(np.median(envelopes, axis=0), 1e-12)
+            scores, _ = self._score(envelopes, np.broadcast_to(floor, envelopes.shape))
+            return TrackingFrame("raw", quality, 0, envelopes, scores)
+
         if self.background is None:
             # Calibrate from non-overlapping updates so the noise estimate is independent.
             if self.calibration_phase == 0:
@@ -193,6 +231,7 @@ class AudiodeviceTracker:
             raise ValueError("Expected finite audio samples with six channels")
         if len(samples) == 0:
             return []
+        samples = self.notch_filter.push(samples)
         self.buffer = np.concatenate((self.buffer, samples), axis=0)
         stride = PINGS_PER_UPDATE * PERIOD
         required = stride + len(self.reference) - 1

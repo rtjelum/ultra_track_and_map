@@ -39,6 +39,36 @@ class AudiodeviceLiveTests(unittest.TestCase):
             plt.close(app.figure)
             app.shutdown()
 
+    def test_raw_mode_shows_heat_map_without_calibration_or_position(self):
+        app = gui.LiveDemo("serial", (18000, 22000), 20, 10, raw=True)
+        try:
+            scores = np.full_like(app.heat.get_array(), 3.0)
+            app._show_frame(tracking.TrackingFrame("raw", 9.0, 0,
+                                                   np.ones((tracking.PERIOD, 6)), scores))
+            self.assertTrue(np.all(app.heat.get_array() == 3.0))
+            self.assertEqual(app.heat.get_clim(), (0, 3.0))
+            self.assertEqual(len(app.marker.get_xdata()), 0)
+            self.assertIn("Raw echo map", app.status.get_text())
+            app.worker = Mock()
+            app.recalibrate()
+            self.assertFalse(app.recalibrate_event.is_set())
+            app.worker = None
+        finally:
+            plt.close(app.figure)
+            app.shutdown()
+
+    def test_cli_passes_default_level_and_raw_notch_to_live_demo(self):
+        demo = Mock()
+        with (patch.object(gui.sys, "argv",
+                           ["audiodevice_live.py", "--serial", "serial",
+                            "--raw", "--notch", "19000"]),
+              patch.object(gui.matplotlib, "get_backend", return_value="TkAgg"),
+              patch.object(gui, "LiveDemo", return_value=demo) as create,
+              patch.object(gui.plt, "show")):
+            self.assertEqual(gui.main(), 0)
+        create.assert_called_once_with("serial", (18000, 22000), 20, None,
+                                       notch=[19000], raw=True)
+
     def test_stop_signals_the_worker_and_finishes_cleanup(self):
         entered = threading.Event()
 

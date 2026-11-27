@@ -59,9 +59,11 @@ class LiveSession:
     """One device session at a time, broadcast to any number of browser clients."""
 
     def __init__(self, serial, band, level, duration=None, stream=None, *,
-                 lidar_port=None, lidar_root=False, lidar_stream=None):
+                 lidar_port=None, lidar_root=False, lidar_stream=None, notch=(), raw=False):
         self.serial = serial
         self.band = tuple(band)
+        self.notch = tuple(notch)
+        self.raw = raw
         self.level = level
         self.duration = duration
         self.stream = stream or audio.stream
@@ -90,10 +92,11 @@ class LiveSession:
         return self._config
 
     def _make_config(self):
-        model = mapper.LiveMapper(*self.band)
+        model = mapper.live_model(*self.band, notch_hz=self.notch, raw=self.raw)
         return {
             "serial": self.serial, "band": self.band, "level": self.level,
             "duration": self.duration,
+            "raw": self.raw,
             "depths": [round(v, 3) for v in model.depths],
             "laterals": [round(v, 3) for v in model.laterals],
             "mics": tracker.MIC_POSITIONS.tolist(),
@@ -172,7 +175,7 @@ class LiveSession:
 
     def recalibrate(self):
         with self.lock:
-            if self.worker is None or self.stopping:
+            if self.worker is None or self.stopping or self.raw:
                 return False
         self.recalibrate_event.set()
         self._publish("reset", {})
@@ -234,7 +237,7 @@ class LiveSession:
     def _run(self):
         final, error = "", False
         try:
-            model = mapper.LiveMapper(*self.band)
+            model = mapper.live_model(*self.band, notch_hz=self.notch, raw=self.raw)
             synchronized = calibrated = False
 
             def on_status(text):
@@ -248,7 +251,9 @@ class LiveSession:
                     self.recalibrate_event.clear()
                     synchronized = calibrated = False
                 for frame in model.push(samples):
-                    if frame.state == "calibrating":
+                    if frame.state == "raw":
+                        synchronized = calibrated = True
+                    elif frame.state == "calibrating":
                         synchronized = True
                         calibrated |= frame.calibration == tracker.CALIBRATION_UPDATES
                     if not self.stop_event.is_set():
@@ -396,7 +401,13 @@ def main():
                         help="replay a recording (e.g. recordings/walk1) instead of a device")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="replay speed for --recording (default 1 = real time)")
+    parser.add_argument("--notch", type=float, action="append", metavar="HZ",
+                        help="remove a narrowband interfering tone (repeatable; default "
+                             f"{tracker.DEFAULT_NOTCH_HZ:g}; --notch 0 disables)")
+    parser.add_argument("--raw", action="store_true",
+                        help="skip background calibration and show the raw echo heat map")
     args = parser.parse_args()
+    args.notch = tracker.notch_frequencies(args.notch)
     if not 0 < args.level <= 20:
         parser.error("--level must be greater than 0 and no more than 20")
     if args.seconds is not None and args.seconds < 5:
@@ -408,12 +419,15 @@ def main():
             serial = f"recording {args.recording}"
             session = LiveSession(serial, player.band, args.level, args.seconds, player.audio,
                                   lidar_port="recorded LD-19" if player.rec.scans else None,
-                                  lidar_stream=player.lidar)
+                                  lidar_stream=player.lidar, notch=args.notch, raw=args.raw)
         else:
             capture.make_chirp(*args.band)
+            tracker.NotchFilter(args.notch)
             serial = args.serial or capture.connected_serial()
             session = LiveSession(serial, args.band, args.level, args.seconds,
-                                  lidar_port=args.lidar_port, lidar_root=args.lidar_root)
+                                  lidar_port=args.lidar_port, lidar_root=args.lidar_root,
+                                  notch=args.notch, raw=args.raw)
+        session.config()
         server = make_server(session, args.host, args.port)
     except (capture.CaptureError, subprocess.SubprocessError, OSError, ValueError) as exc:
         print(f"Unable to start live server: {exc}", file=sys.stderr)

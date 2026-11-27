@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -36,6 +37,18 @@ class LiveMapperTests(unittest.TestCase):
         self.assertIs(skipped.scores, heat)
         self.assertTrue(np.all(skipped.envelopes[:, [0, 2, 4]] == 1))
         self.assertEqual((lost.state, lost.position), ("no_target", None))
+
+    def test_notch_filters_mapper_input_across_chunks(self):
+        live = mapper.LiveMapper(notch_hz=[21_000])
+        t = np.arange(6000) / 48_000
+        samples = np.tile(np.sin(2 * np.pi * 21_000 * t)[:, None], (1, 6))
+        with patch.object(live.mapper, "push", return_value=[]) as push:
+            live.push(samples[:1700])
+            live.push(samples[1700:])
+        filtered = np.concatenate([call.args[0] for call in push.call_args_list])
+        self.assertLess(np.max(np.abs(filtered[4000:])), 0.01)
+        with self.assertRaises(ValueError):
+            live.push(np.full((10, 6), np.nan))
 
     @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "recordings", "walk1.flac")),
                          "needs recordings/walk1")

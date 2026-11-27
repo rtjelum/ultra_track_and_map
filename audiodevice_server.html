@@ -47,7 +47,7 @@
 </header>
 <main>
   <div class="panel">
-    <h2>Ultrasound evidence + LD-19 scan</h2>
+    <h2 id="map-title">Ultrasound evidence + LD-19 scan</h2>
     <div class="controls">
       <label><input id="show-heat" type="checkbox" checked> Ultrasound evidence</label>
       <label><input id="show-lidar" type="checkbox" checked> LiDAR returns</label>
@@ -189,7 +189,9 @@ function drawMap() {
   const m = mapGeometry(c);
   const step = 0.05;
   if ($("show-heat").checked && frame && frame.scores) {
-    const vmax = Math.max(2, (frame.threshold || 0) * 1.5);
+    const vmax = frame.threshold == null
+      ? Math.max(2, ...frame.scores.map(row => Math.max(...row)))
+      : Math.max(2, frame.threshold * 1.5);
     g.globalAlpha = 0.8;
     frame.scores.forEach((row, i) => row.forEach((v, j) => {
       const [r, gg, b] = magma(v / vmax);
@@ -293,6 +295,7 @@ function drawTraces() {
 
 const STATE_TEXT = {
   syncing: "Waiting for a stable chirp reference — no position.",
+  raw: "Raw echo map (no calibration) — no position.",
   no_target: "No sufficiently supported change — no position.",
   candidate: "Unconfirmed candidate — position accuracy is unverified.",
   tracking: "Experimental candidate — position accuracy is unverified.",
@@ -301,24 +304,27 @@ const STATE_TEXT = {
 function render() {
   const lines = [
     `Device: ${cfg ? cfg.serial : "?"}`,
-    "Remove the moving target during calibration. Tracking: AudiodeviceMapper on the " +
-    "front mics, range and angle calibrated against a LiDAR on one recording (walk1); " +
-    "not ground truth. Hotter colors indicate stronger change, not a room map.",
+    cfg?.raw
+      ? "Raw mode: no background calibration or position estimate. Hotter colors indicate " +
+        "stronger echoes, including walls and furniture; this is not a calibrated room map."
+      : "Remove the moving target during calibration. Tracking: AudiodeviceMapper on the " +
+        "front mics, range and angle calibrated against a LiDAR on one recording (walk1); " +
+        "not ground truth. Hotter colors indicate stronger change, not a room map.",
   ];
   if (frame) {
-    lines.push("", `Chirp lock: ${frame.sync_ratio.toFixed(2)}`,
-               `Front mics used: ${frame.support} / 3`);
+    lines.push("", `Chirp lock: ${frame.sync_ratio.toFixed(2)}`);
+    if (!cfg?.raw) lines.push(`Front mics used: ${frame.support} / 3`);
     if (frame.position) {
       const [d, l] = frame.position;
       lines.push(`Candidate: ${d.toFixed(2)} m forward, ${l >= 0 ? "+" : ""}${l.toFixed(2)} m right`);
     }
   }
   $("info").textContent = lines.join("\n");
-  $("trace-title").textContent = frame && frame.state !== "calibrating"
+  $("trace-title").textContent = frame && !["calibrating", "raw"].includes(frame.state)
     ? "Change from calibrated background" : "Matched-filter response";
   drawMap(); drawTraces();
   $("start").disabled = !connected || status.running;
-  $("recal").disabled = !connected || !status.running || status.stopping;
+  $("recal").disabled = !connected || !status.running || status.stopping || cfg?.raw;
   $("stop").disabled = !connected || !status.running || status.stopping;
   $("lidar-start").disabled = !connected || !cfg?.lidar_port || lidarStatus.running;
   $("lidar-stop").disabled = !connected || !lidarStatus.running || lidarStatus.stopping;
@@ -378,6 +384,7 @@ async function init() {
   const response = await fetch("/api/config");
   if (!response.ok) throw new Error(`Configuration request failed: ${response.status}`);
   cfg = await response.json();
+  if (cfg.raw) $("map-title").textContent = "Raw echo strength (includes static reflections) + LD-19 scan";
   $("settings").textContent = `${cfg.band[0] / 1000}–${cfg.band[1] / 1000} kHz | ${cfg.level}% digital peak | ` +
     (cfg.duration == null ? "runs until Stop." : `${cfg.duration} s session.`);
   $("trace-legend").innerHTML = COLORS.map((c, i) => `<span><i style="background:${c}"></i>Mic ${i}</span>`).join("");

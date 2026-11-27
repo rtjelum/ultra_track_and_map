@@ -439,8 +439,9 @@ class LiveMapper:
     speaker, ``scores`` the mapper's change-evidence grid over
     ``depths`` × ``laterals``."""
 
-    def __init__(self, low_hz=18_000, high_hz=22_000, **mapper_args):
+    def __init__(self, low_hz=18_000, high_hz=22_000, *, notch_hz=(), **mapper_args):
         self.mapper = AudiodeviceMapper(low_hz, high_hz, **mapper_args)
+        self.notch_filter = geometry.NotchFilter(notch_hz)
         self.depths = self.mapper.heat_depths
         self.laterals = self.mapper.heat_laterals
         self.channels = list(self.mapper.channels)
@@ -451,7 +452,10 @@ class LiveMapper:
         self._last = (None, None)
 
     def push(self, samples):
-        return [self._frame(f) for f in self.mapper.push(samples)]
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.ndim != 2 or samples.shape[1] != 6 or not np.isfinite(samples).all():
+            raise ValueError("Expected finite audio samples with six channels")
+        return [self._frame(f) for f in self.mapper.push(self.notch_filter.push(samples))]
 
     def _frame(self, f):
         TF = geometry.TrackingFrame
@@ -471,3 +475,9 @@ class LiveMapper:
         return TF("tracking" if tracking else "no_target", f.lock_quality, calibration, env,
                   heat, f.threshold, f.position if tracking else None,
                   len(self.channels) if tracking else 0, f.facing_wall_m)
+
+
+def live_model(low_hz, high_hz, *, notch_hz=(), raw=False):
+    if raw:
+        return geometry.AudiodeviceTracker(low_hz, high_hz, notch_hz=notch_hz, raw=True)
+    return LiveMapper(low_hz, high_hz, notch_hz=notch_hz)

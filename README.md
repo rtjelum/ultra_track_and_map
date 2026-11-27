@@ -336,12 +336,22 @@ Replace `SERIAL` with the device's ADB serial, or omit `--serial` to detect a
 single connected ADB device. The example uses 20% digital peak because a 1%
 device test did not synchronize, while one 20% test synchronized and completed
 calibration. **Neither result establishes a safe acoustic level.** The GUI
-defaults to 1%; `--level` accepts values above zero through 20%. By default a
+defaults to 20%; `--level` accepts values above zero through 20%. By default a
 session plays chirps continuously until **Stop** is pressed or the window is
 closed (a single playback stream ends by itself after about 3.1 hours, the
 32-bit WAV size limit). `--seconds N` optionally ends the session after N
 seconds (minimum 5). Chirps begin at 10 kHz or above and end below 24 kHz; the
 default is 18–22 kHz.
+
+If synchronization fails because of a steady ultrasonic tone in the chirp
+band, `--notch HZ` removes the tone before processing. It is repeatable and
+replaces the default 21 kHz notch; `--notch 0` disables notching.
+
+`--raw` uses the experimental matched-filter tracker without background
+calibration. Its heat map shows echo strength relative to each microphone's
+median, including static reflections and direct-path leakage. It reports no
+position, and **Recalibrate** has no effect. Its grid extends to 2.5 m forward
+and 1.5 m to either side, unlike the normal mapper's larger grid.
 
 Opening the window does not play audio. Press **Start** to begin the
 session. Leave the target out and the background still during synchronization
@@ -383,8 +393,8 @@ Matplotlib window, so use the server when the GUI feels slow:
 
 Open the printed address (default `http://localhost:8765/`; with VS Code
 Remote, forward the port) and press **Start**, **Recalibrate** or **Stop**. It
-accepts the same `--band`, `--level` and `--seconds` options as the GUI, plus
-`--port`. Unlike the GUI, the server defaults to `--level 20`. Opening the page does not play audio. Only one device session runs at
+accepts the same `--band`, `--level`, `--seconds`, `--notch` and `--raw`
+options as the GUI, plus `--port`. Both default to `--level 20`. Opening the page does not play audio. Only one device session runs at
 a time; every open page shows the same live stream. Updates are sent with
 Server-Sent Events at the tracker's rate of 10 per second, and a slow page
 skips stale updates rather than delaying the stream.

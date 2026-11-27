@@ -28,10 +28,12 @@ connected_serial = capture.connected_serial
 
 
 class LiveDemo:
-    def __init__(self, serial, band, level, duration=None, stream=None):
+    def __init__(self, serial, band, level, duration=None, stream=None, *, notch=(), raw=False):
         self.stream = stream            # None: the device (audio.stream)
         self.serial = serial
         self.band = band
+        self.notch = tuple(notch)
+        self.raw = raw
         self.level = level
         self.duration = duration
         self.messages = queue.Queue()
@@ -43,7 +45,7 @@ class LiveDemo:
         self.closed = False
         self.history = deque(maxlen=30)
 
-        model = mapper.LiveMapper(*band)
+        model = mapper.live_model(*band, notch_hz=self.notch, raw=self.raw)
         self.figure = plt.figure(figsize=(13, 7.5), facecolor="#101722")
         self.figure.suptitle("Audiodevice live chirp tracker — EXPERIMENTAL",
                              color="white", fontsize=15, y=0.97)
@@ -88,7 +90,8 @@ class LiveDemo:
         self.map_axis.set_aspect("equal", adjustable="box")
         self.map_axis.set_xlabel("Left / right of device centre (m)", color="white")
         self.map_axis.set_ylabel("Distance in front of speaker (m)", color="white")
-        self.map_axis.set_title("Change evidence — not a room map", color="white")
+        self.map_axis.set_title("Raw echo strength — includes static reflections" if raw
+                                else "Change evidence — not a room map", color="white")
         self.map_axis.legend(loc="upper right", fontsize=7, framealpha=0.75)
 
         self.trace_count = min(mapper.WINDOW, int(TRACE_PATH_M * capture.RATE / tracker.SPEED_OF_SOUND))
@@ -137,17 +140,22 @@ class LiveDemo:
         self._set_info()
 
     def _set_info(self, frame=None):
-        lines = [
-            f"Device: {self.serial}",
-            "Remove the moving target during calibration.",
-            "Tracking: AudiodeviceMapper on the front mics,",
-            "range and angle calibrated against a LiDAR on one",
-            "recording (walk1); not ground truth. Hotter colors",
-            "indicate stronger change, not a room map.",
-        ]
+        lines = [f"Device: {self.serial}"]
+        if self.raw:
+            lines.extend(("Raw mode: no background calibration and no",
+                          "position estimate. Hotter colors indicate stronger",
+                          "echoes, including walls and furniture; this is",
+                          "not a calibrated room map."))
+        else:
+            lines.extend(("Remove the moving target during calibration.",
+                          "Tracking: AudiodeviceMapper on the front mics,",
+                          "range and angle calibrated against a LiDAR on one",
+                          "recording (walk1); not ground truth. Hotter colors",
+                          "indicate stronger change, not a room map."))
         if frame is not None:
-            lines.extend(("", f"Chirp lock: {frame.sync_ratio:.2f}",
-                          f"Front mics used: {frame.support} / 3"))
+            lines.extend(("", f"Chirp lock: {frame.sync_ratio:.2f}"))
+            if not self.raw:
+                lines.append(f"Front mics used: {frame.support} / 3")
             if frame.position is not None:
                 depth, lateral = frame.position
                 lines.append(f"Candidate: {depth:.2f} m forward, {lateral:+.2f} m right")
@@ -177,7 +185,7 @@ class LiveDemo:
     def _run(self):
         reported = False
         try:
-            model = mapper.LiveMapper(*self.band)
+            model = mapper.live_model(*self.band, notch_hz=self.notch, raw=self.raw)
             synchronized = False
             calibrated = False
 
@@ -192,7 +200,9 @@ class LiveDemo:
                     synchronized = False
                     calibrated = False
                 for frame in model.push(samples):
-                    if frame.state == "calibrating":
+                    if frame.state == "raw":
+                        synchronized = calibrated = True
+                    elif frame.state == "calibrating":
                         synchronized = True
                         calibrated |= frame.calibration == tracker.CALIBRATION_UPDATES
                     self.messages.put(("frame", frame))
@@ -223,7 +233,7 @@ class LiveDemo:
                 self.messages.put(("done", ""))
 
     def recalibrate(self, _event=None):
-        if self.worker is None or self.stopping:
+        if self.worker is None or self.stopping or self.raw:
             return
         self.recalibrate_event.set()
         self._clear_position(clear_history=True)
@@ -271,7 +281,7 @@ class LiveDemo:
                     continue
                 line.set_data(self.trace_x, envelope / maximum if maximum > 0 else envelope)
             self.signal_axis.set_title(
-                "Matched-filter response" if frame.state == "calibrating"
+                "Matched-filter response" if frame.state in ("calibrating", "raw")
                 else "Change from calibrated background", color="white"
             )
         else:
@@ -279,7 +289,8 @@ class LiveDemo:
                 line.set_data([], [])
         if frame.scores is not None:
             self.heat.set_data(frame.scores)
-            self.heat.set_clim(0, max(2.0, frame.threshold * 1.5))
+            self.heat.set_clim(0, max(2.0, float(np.max(frame.scores))
+                                      if frame.threshold is None else frame.threshold * 1.5))
         else:
             self.heat.set_data(np.zeros_like(self.heat.get_array()))
         if frame.position is None:
@@ -298,6 +309,8 @@ class LiveDemo:
                 f"Calibrating {frame.calibration}/{tracker.CALIBRATION_UPDATES}: "
                 "keep the target out and the room still."
             )
+        elif frame.state == "raw":
+            self.status.set_text("Raw echo map (no calibration) — no position.")
         elif frame.state == "no_target":
             self.status.set_text("No sufficiently supported change — no position.")
         elif frame.state == "candidate":
@@ -351,15 +364,21 @@ def main():
     parser.add_argument("--serial", help="ADB serial; auto-detect one connected Audiodevice if omitted")
     parser.add_argument("--band", type=float, nargs=2, default=(18_000, 22_000),
                         metavar=("LOW_HZ", "HIGH_HZ"))
-    parser.add_argument("--level", type=float, default=1,
-                        help="digital peak percentage (default 1; maximum 20)")
+    parser.add_argument("--level", type=float, default=20,
+                        help="digital peak percentage (default 20; maximum 20)")
     parser.add_argument("--seconds", type=int,
                         help="optional session length in seconds (default: run until Stop)")
     parser.add_argument("--recording", metavar="STEM",
                         help="replay a recording (e.g. recordings/walk1) instead of a device")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="replay speed for --recording (default 1 = real time)")
+    parser.add_argument("--notch", type=float, action="append", metavar="HZ",
+                        help="remove a narrowband interfering tone (repeatable; default "
+                             f"{tracker.DEFAULT_NOTCH_HZ:g}; --notch 0 disables)")
+    parser.add_argument("--raw", action="store_true",
+                        help="skip background calibration and show the raw echo heat map")
     args = parser.parse_args()
+    args.notch = tracker.notch_frequencies(args.notch)
     if not 0 < args.level <= 20:
         parser.error("--level must be greater than 0 and no more than 20")
     if args.seconds is not None and args.seconds < 5:
@@ -372,10 +391,12 @@ def main():
             import audiodevice_recording as recording
             player = recording.Player(args.recording, args.speed)
             demo = LiveDemo(f"recording {args.recording}", player.band, args.level,
-                            args.seconds, player.audio)
+                            args.seconds, player.audio, notch=args.notch, raw=args.raw)
         else:
+            tracker.NotchFilter(args.notch)
             serial = args.serial or connected_serial()
-            demo = LiveDemo(serial, args.band, args.level, args.seconds)
+            demo = LiveDemo(serial, args.band, args.level, args.seconds,
+                            notch=args.notch, raw=args.raw)
         previous_handler = signal.getsignal(signal.SIGTERM)
         def interrupt(_signum, _frame):
             raise KeyboardInterrupt

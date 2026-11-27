@@ -99,6 +99,34 @@ class AudiodeviceServerTests(unittest.TestCase):
         walled = server.frame_payload(tracking.TrackingFrame("no_target", 5.0, 4, facing_wall_m=4.3214))
         self.assertEqual(walled["facing_wall_m"], 4.321)
 
+    def test_raw_session_config_recalibration_and_frames(self):
+        self.session.raw = True
+        self.session.notch = (19_000,)
+        config = self.session.config()
+        self.assertTrue(config["raw"])
+        self.assertEqual((len(config["depths"]), len(config["laterals"])), (45, 61))
+
+        model = tracking.AudiodeviceTracker(raw=True, notch_hz=self.session.notch)
+        raw = tracking.TrackingFrame("raw", 5.0, 0, np.ones((tracking.PERIOD, 6)),
+                                     np.ones((45, 61)))
+        with (patch.object(server.mapper, "live_model", return_value=model) as factory,
+              patch.object(model, "push", return_value=[raw])):
+            def stream(_serial, _low, _high, _level, _duration, _stop, _status, samples):
+                samples(np.zeros((1, 6)))
+            self.session.stream = stream
+            self.session.worker = threading.current_thread()
+            self.assertFalse(self.session.recalibrate())
+            client = self.session.subscribe()
+            self.session._run()
+            events = [client.get_nowait() for _ in range(client.qsize())]
+            self.session.unsubscribe(client)
+        factory.assert_called_once_with(18000, 22000, notch_hz=(19000,), raw=True)
+        payload = next(data for kind, data in events if kind == "frame")
+        self.assertEqual(payload["state"], "raw")
+        self.assertIsNone(payload["position"])
+        self.assertIsNone(payload["threshold"])
+        self.assertIn("Session finished", self.session.status["text"])
+
     def test_lidar_controls_and_replay_do_not_start_audio(self):
         self.session.lidar_port = "/dev/ttyUSB0"
         started = threading.Event()

@@ -99,6 +99,45 @@ class AudiodeviceTrackingTests(unittest.TestCase):
         # Calibration still spans CALIBRATION_UPDATES non-overlapping five-ping groups.
         self.assertEqual(len(calibrating), (live.CALIBRATION_UPDATES - 1) * live.PINGS_PER_UPDATE + 1)
 
+    def test_notch_restores_sync_under_in_band_tone(self):
+        import audiodevice_mapper as mapper
+
+        samples = synthetic_audio()
+        t = np.arange(len(samples)) / capture.RATE
+        samples += (2.0 * np.sin(2 * np.pi * 21_000 * t))[:, None].astype(np.float32)
+        plain = process_chunks(live.AudiodeviceTracker(), samples)
+        self.assertNotIn("calibrating", [frame.state for frame in plain])
+        notched = process_chunks(live.AudiodeviceTracker(notch_hz=[21_000]), samples)
+        self.assertIn("calibrating", [frame.state for frame in notched])
+        plain_mapper = process_chunks(mapper.LiveMapper(), samples)
+        self.assertNotIn("calibrating", [frame.state for frame in plain_mapper])
+        notched_mapper = process_chunks(mapper.LiveMapper(notch_hz=[21_000]), samples)
+        self.assertIn("calibrating", [frame.state for frame in notched_mapper])
+
+    def test_raw_mode_maps_static_echoes_without_calibration(self):
+        tracker = live.AudiodeviceTracker(raw=True)
+        frames = process_chunks(tracker, synthetic_audio())
+        self.assertNotIn("calibrating", [frame.state for frame in frames])
+        raw = [frame for frame in frames if frame.state == "raw"]
+        self.assertTrue(raw)
+        self.assertTrue(all(frame.position is None and frame.threshold is None for frame in raw))
+        peak = np.unravel_index(int(np.argmax(raw[-1].scores)), raw[-1].scores.shape)
+        found = np.array([tracker.depths[peak[0]], tracker.laterals[peak[1]]])
+        self.assertLess(np.linalg.norm(found - [1.5, -0.4]), 0.15)
+
+    def test_notch_configuration_and_chunk_continuity(self):
+        self.assertEqual(live.notch_frequencies(None), [21_000])
+        self.assertEqual(live.notch_frequencies([0]), [])
+        self.assertEqual(live.notch_frequencies([0, 19_000, 20_000]), [19_000, 20_000])
+        for invalid in (-1, 24_000, float("nan")):
+            with self.assertRaises(ValueError):
+                live.NotchFilter([invalid])
+        samples = np.random.default_rng(42).normal(size=(2000, 6)).astype(np.float32)
+        whole = live.NotchFilter([21_000]).push(samples)
+        filt = live.NotchFilter([21_000])
+        chunks = np.concatenate([filt.push(samples[:731]), filt.push(samples[731:])])
+        np.testing.assert_array_equal(chunks, whole)
+
     def test_rejects_bad_sample_shapes(self):
         tracker = live.AudiodeviceTracker()
         with self.assertRaises(ValueError):
